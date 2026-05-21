@@ -47,6 +47,14 @@ if False:
     from curobo.cuda_robot_model.cuda_robot_model import CudaRobotModel, CudaRobotModelConfig
     from curobo.util_file import get_robot_path, join_path, load_yaml
 
+
+def _closed_dof_positions(lower, upper):
+    """Return closed/default articulated DOF positions: zero clipped into each joint limit."""
+    lower = np.asarray(lower, dtype=np.float32)
+    upper = np.asarray(upper, dtype=np.float32)
+    return np.clip(np.zeros_like(lower, dtype=np.float32), lower, upper)
+
+
 class ObjectGym():
     def __init__(
             self, 
@@ -148,6 +156,7 @@ class ObjectGym():
         
         # save root
         self.asset_root = self.cfgs["asset"]["asset_root"]
+        self.arti_asset_root = self.cfgs["asset"].get("arti_asset_root", self.asset_root)
         self.save_root = save_root
         
         # prepare assets
@@ -312,7 +321,7 @@ class ObjectGym():
         self.gapart_raw_valid_annos = []
         for gapartnet_id in self.gapartnet_ids:
             # load object annotation
-            annotation_path = f"{self.asset_root}/{self.gapartnet_root}/{gapartnet_id}/link_annotation_gapartnet.json"
+            annotation_path = f"{self.arti_asset_root}/{self.gapartnet_root}/{gapartnet_id}/link_annotation_gapartnet.json"
             anno = json.loads(open(annotation_path).read())
             num_link_anno = len(anno)
             gapart_raw_valid_anno = []
@@ -440,11 +449,11 @@ class ObjectGym():
         arti_obj_asset_options.collapse_fixed_joints = True # default False
         # arti_obj_asset_options.convex_decomposition_from_submeshes = True
         arti_obj_asset_options.armature = 0.005 # default 0.0
-        arti_obj_asset_options.vhacd_enabled = True
+        arti_obj_asset_options.vhacd_enabled = self.cfgs["asset"].get("arti_vhacd_enabled", True)
         arti_obj_asset_options.vhacd_params = gymapi.VhacdParams()
         arti_obj_asset_options.vhacd_params.resolution = 100000 # 1000000
         arti_obj_asset_options.default_dof_drive_mode = gymapi.DOF_MODE_NONE
-        arti_obj_asset_options.disable_gravity = False
+        arti_obj_asset_options.disable_gravity = self.cfgs["asset"].get("arti_disable_gravity", True)
         arti_obj_asset_options.flip_visual_attachments = False
         
         # unused settings, be careful, otherwise it will cause error
@@ -457,7 +466,7 @@ class ObjectGym():
         # obj_asset_options.vhacd_enabled = True
         # obj_asset_options.vhacd_params = gymapi.VhacdParams()
         # obj_asset_options.vhacd_params.resolution = 1000000
-        self.arti_obj_assets = [self.gym.load_asset(self.sim, self.asset_root, arti_obj_path, arti_obj_asset_options)
+        self.arti_obj_assets = [self.gym.load_asset(self.sim, self.arti_asset_root, arti_obj_path, arti_obj_asset_options)
                                 for arti_obj_path in arti_obj_paths]
 
         ### TODO: support multiple loading from here
@@ -470,12 +479,15 @@ class ObjectGym():
         # set physical props
         self.arti_obj_dof_props = self.gym.get_asset_dof_properties(self.arti_obj_asset)
         # self.arti_obj_dof_props['stiffness'][:] = 10.0 
-        self.arti_obj_dof_props['damping'][:] = 10.0      # large damping can reduce interia(?)
-        # self.arti_obj_dof_props['friction'][:] = 5.0
+        self.arti_obj_dof_props['damping'][:] = self.cfgs['asset'].get('arti_dof_damping', 10.0)      # large damping can reduce interia(?)
+        self.arti_obj_dof_props['friction'][:] = self.cfgs['asset'].get('arti_dof_friction', 0.0)
+        # Keep articulated joints passive so the robot/contact can move them.
+        # Closed-state stability is handled by disabling gravity on the fixed-base
+        # articulated asset, not by position-driving joints closed.
         self.arti_obj_dof_props["driveMode"][:] = gymapi.DOF_MODE_NONE
         
         
-        init_pos = self.arti_obj_dof_props["lower"]
+        init_pos = _closed_dof_positions(self.arti_obj_dof_props["lower"], self.arti_obj_dof_props["upper"])
         self.arti_obj_default_dof_pos = np.zeros(self.arti_obj_num_dofs, dtype=np.float32)
         self.arti_obj_default_dof_state = np.zeros(self.arti_obj_num_dofs, gymapi.DofState.dtype)
         self.arti_obj_default_dof_state["pos"] = init_pos
@@ -600,6 +612,10 @@ class ObjectGym():
                 self.arti_init_obj_pos_list.append([arti_initial_pose.p.x, arti_initial_pose.p.y, arti_initial_pose.p.z])
                 self.arti_init_obj_rot_list.append([arti_initial_pose.r.x, arti_initial_pose.r.y, arti_initial_pose.r.z, arti_initial_pose.r.w])
                 arti_obj_actor_handle = self.gym.create_actor(env, self.arti_obj_asset, arti_initial_pose, 'arti_actor', i, 1, 0) #1, self.asset_seg_ids[-1] + 1
+                # Scale immediately after actor creation.  Setting scale after DOF
+                # states can cause IsaacGym to rebuild articulation transforms and
+                # lose/shift the requested closed DOF pose for revolute assets.
+                self.gym.set_actor_scale(env, arti_obj_actor_handle, self.cfgs["asset"]["arti_obj_scale"])
                 
                 self.gym.set_actor_dof_properties(env, arti_obj_actor_handle, self.arti_obj_dof_props)
                 # set initial dof states
@@ -610,7 +626,6 @@ class ObjectGym():
                 self.gym.set_actor_dof_position_targets(env, arti_obj_actor_handle, self.arti_obj_default_dof_state["pos"])
                 arti_obj_actor_idx = self.gym.get_actor_rigid_body_index(env, arti_obj_actor_handle, 0, gymapi.DOMAIN_SIM)
                 self.arti_obj_actor_idxs.append(arti_obj_actor_idx)
-                self.gym.set_actor_scale(env, arti_obj_actor_handle, self.cfgs["asset"]["arti_obj_scale"])
                 
                 agent_shape_props = self.gym.get_actor_rigid_shape_properties(env, arti_obj_actor_handle)
                 for agent_shape_prop in agent_shape_props:

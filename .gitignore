@@ -11,3 +11,22 @@ example_rendered/
 partnet_mobility_part
 ckpts/
 assets/
+
+# Tool/agent artifacts
+openspec/
+docs/
+.codex/
+.agents/
+
+# Build artifacts
+pointnet2_ops_lib/build/
+**/*.egg-info/
+**/*.so
+
+# Runtime outputs
+manipulation/output/
+
+# Python cache
+*.pyc
+*.pyo
+.pytest_cache/
