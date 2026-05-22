@@ -44,6 +44,7 @@ import sys
 import tqdm
 import xml.etree.ElementTree as ET
 import subprocess
+import cv2
 from isaacgym import gymapi, gymtorch, gymutil
 from pytorch3d.transforms import matrix_to_quaternion, quaternion_invert
 
@@ -270,6 +271,73 @@ def _resolve_controlling_joint(link_name, fixed_parent, fixed_rotation, movable_
     return None
 
 
+def _same_resolved_joint(a, b):
+    if a is None or b is None:
+        return False
+    return (
+        a.get("name") == b.get("name")
+        and a.get("type") == b.get("type")
+        and a.get("movable_link") == b.get("movable_link")
+    )
+
+
+def _select_bbox_for_requested_part(
+    requested_part_id,
+    gapart_anno,
+    gapart_raw_valid_anno,
+    fixed_parent,
+    fixed_rotation,
+    movable_joints_by_child,
+):
+    """Map a requested movable part id to the fixed handle that controls it."""
+    raw_to_valid_bbox_id = {
+        raw_i: valid_i
+        for valid_i, raw_i in enumerate([i for i, anno in enumerate(gapart_anno) if anno.get("is_gapart")])
+    }
+    selected_bbox_id = None
+    selected_source = None
+    if requested_part_id is not None:
+        if requested_part_id in raw_to_valid_bbox_id:
+            selected_bbox_id = raw_to_valid_bbox_id[requested_part_id]
+            selected_source = "raw_part_id"
+        else:
+            selected_bbox_id = requested_part_id
+            selected_source = "valid_bbox_id"
+    if selected_bbox_id is None:
+        selected_bbox_id = _select_highest_fixed_handle(gapart_raw_valid_anno)
+        selected_source = "highest_fixed_handle"
+    if selected_bbox_id is None:
+        return -1, selected_source, None
+    if selected_bbox_id < 0 or selected_bbox_id >= len(gapart_raw_valid_anno):
+        return selected_bbox_id, selected_source, None
+
+    selected_anno = gapart_raw_valid_anno[selected_bbox_id]
+    selected_joint = _resolve_controlling_joint(
+        selected_anno.get("link_name", ""),
+        fixed_parent,
+        fixed_rotation,
+        movable_joints_by_child,
+    )
+    selected_category = selected_anno.get("category", "")
+    if selected_category.endswith("fixed_handle") or selected_joint is None:
+        return selected_bbox_id, selected_source, selected_joint
+
+    # Batch plans address movable parts, but manipulation must grasp the handle.
+    # Choose the fixed handle attached through fixed joints to the same movable link.
+    for anno_i, anno in enumerate(gapart_raw_valid_anno):
+        if not anno.get("category", "").endswith("fixed_handle"):
+            continue
+        handle_joint = _resolve_controlling_joint(
+            anno.get("link_name", ""),
+            fixed_parent,
+            fixed_rotation,
+            movable_joints_by_child,
+        )
+        if _same_resolved_joint(selected_joint, handle_joint):
+            return anno_i, f"{selected_source}_mapped_to_handle", handle_joint
+    return selected_bbox_id, selected_source, selected_joint
+
+
 def _select_highest_fixed_handle(gapart_raw_valid_anno):
     best_idx = None
     best_z = -float("inf")
@@ -297,6 +365,19 @@ def _compute_pull_targets(init_position, approach_dir, pull_dir, grasp_offset, p
         [grasp_position + (step_i + 1) * pull_step * pull_dir for step_i in range(pull_steps)],
         axis=0,
     )
+
+
+def _legacy_open_demo_targets(init_position, handle_out):
+    """Return the c8d4ad2 run_arti_open single-path targets."""
+    init_position = np.asarray(init_position, dtype=np.float32)
+    handle_out = np.asarray(handle_out, dtype=np.float32)
+    pre_grasp_position = init_position + 0.2 * handle_out
+    grasp_position = init_position + 0.1 * handle_out
+    pull_targets = np.asarray(
+        [init_position + (0.1 + i * 0.01) * handle_out for i in range(30)],
+        dtype=np.float32,
+    )
+    return pre_grasp_position, grasp_position, pull_targets
 
 
 def _get_arti_dof_positions(gym):
@@ -414,16 +495,131 @@ def _apply_assisted_revolute_motion(gym, dof_initial, target_dof_index, lower, u
             gym.gym.render_all_camera_sensors(gym.sim)
             step_str = str(step_num + i).zfill(4)
             os.makedirs(f"{save_root}/video", exist_ok=True)
-            gym.gym.write_camera_image_to_file(gym.sim, gym.envs[0], gym.cams[0][0], gymapi.IMAGE_COLOR, f"{save_root}/video/step-{step_str}.png")
+            gym.save_camera_frame(f"{save_root}/video/step-{step_str}.png")
     return step_num + steps, goal
 
 
-def _write_video_mp4_from_frames(save_root, output_name="manipulation_debug.mp4", fps=30):
+def _probe_video_metadata(video_path):
+    metadata = {
+        "path": video_path,
+        "exists": bool(video_path and os.path.exists(video_path)),
+        "probe_warnings": [],
+    }
+    if not metadata["exists"]:
+        return metadata
+    ffprobe_cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=codec_name,width,height,nb_frames,r_frame_rate",
+        "-show_entries",
+        "format=duration,size",
+        "-of",
+        "json",
+        video_path,
+    ]
+    try:
+        completed = subprocess.run(
+            ffprobe_cmd,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        probed = json.loads(completed.stdout)
+        streams = probed.get("streams") or []
+        stream = streams[0] if streams else {}
+        fmt = probed.get("format") or {}
+        metadata.update({
+            "codec": stream.get("codec_name"),
+            "width": int(stream["width"]) if stream.get("width") is not None else None,
+            "height": int(stream["height"]) if stream.get("height") is not None else None,
+            "nb_frames": int(stream["nb_frames"]) if str(stream.get("nb_frames", "")).isdigit() else None,
+            "r_frame_rate": stream.get("r_frame_rate"),
+            "duration": float(fmt["duration"]) if fmt.get("duration") is not None else None,
+            "size": int(fmt["size"]) if fmt.get("size") is not None else None,
+            "probe": "ffprobe",
+        })
+        return metadata
+    except Exception as exc:
+        metadata["probe_warnings"].append(f"ffprobe_failed: {exc}")
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        metadata["probe_warnings"].append("opencv_videocapture_failed")
+        return metadata
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = float(cap.get(cv2.CAP_PROP_FPS))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    metadata.update({
+        "nb_frames": frame_count if frame_count >= 0 else None,
+        "fps": fps if fps > 0 else None,
+        "duration": (frame_count / fps) if frame_count >= 0 and fps > 0 else None,
+        "width": width if width > 0 else None,
+        "height": height if height > 0 else None,
+        "probe": "opencv",
+    })
+    return metadata
+
+
+def _frame_sequence_metadata(save_root, extension="png"):
+    video_dir = os.path.join(save_root, "video")
+    pattern = os.path.join(video_dir, f"step-*.{extension}")
+    frames = sorted(glob.glob(pattern))
+    metadata = {
+        "directory": video_dir,
+        "extension": extension,
+        "pattern": pattern,
+        "count": len(frames),
+        "first_frame": frames[0] if frames else None,
+        "last_frame": frames[-1] if frames else None,
+    }
+    if frames:
+        first = cv2.imread(frames[0])
+        if first is not None:
+            metadata["height"], metadata["width"] = [int(v) for v in first.shape[:2]]
+    return metadata
+
+
+def _legacy_output_baseline_metadata(path="output/45661"):
+    video_path = os.path.join(path, "manipulation.mp4")
+    result_path = os.path.join(path, "result.json")
+    png_frames = _frame_sequence_metadata(path, extension="png")
+    jpg_frames = _frame_sequence_metadata(path, extension="jpg")
+    return {
+        "baseline_success_standard": "old_video",
+        "baseline_video": video_path,
+        "baseline_result_json": result_path,
+        "baseline_result_json_exists": os.path.exists(result_path),
+        "baseline_video_metadata": _probe_video_metadata(video_path),
+        "baseline_png_frame_metadata": png_frames,
+        "baseline_jpg_frame_metadata": jpg_frames,
+        "joint_identity_inferred": False,
+        "notes": "Legacy video is visual baseline evidence; without result.json it is not joint identity evidence.",
+    }
+
+
+def _write_video_mp4_from_frames(save_root, output_name="manipulation.mp4", fps=30):
     """Encode all saved PNG frames into an mp4 so the video covers the full manipulation."""
     video_dir = os.path.join(save_root, "video")
+    frame_metadata = _frame_sequence_metadata(save_root, extension="png")
+    result = {
+        "path": os.path.join(save_root, output_name),
+        "writer": None,
+        "fps": fps,
+        "frame_metadata": frame_metadata,
+        "video_metadata": None,
+        "warnings": [],
+    }
     if not os.path.isdir(video_dir):
         print(f"[DIAG] skip mp4: no frame directory {video_dir}")
-        return None
+        result["warnings"].append(f"missing_frame_directory: {video_dir}")
+        return result
     output_path = os.path.join(save_root, output_name)
     frame_pattern = os.path.join(video_dir, "step-*.png")
     cmd = [
@@ -442,10 +638,199 @@ def _write_video_mp4_from_frames(save_root, output_name="manipulation_debug.mp4"
     try:
         subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         print(f"[DIAG] wrote complete mp4: {output_path}")
-        return output_path
+        result["writer"] = "ffmpeg"
+        result["video_metadata"] = _probe_video_metadata(output_path)
+        return result
     except Exception as exc:
-        print(f"[DIAG] failed to write mp4 from frames: {exc}")
-        return None
+        print(f"[DIAG] ffmpeg mp4 encode failed, trying cv2 fallback: {exc}")
+        result["warnings"].append(f"ffmpeg_failed: {exc}")
+    frames = sorted(glob.glob(frame_pattern))
+    if not frames:
+        print(f"[DIAG] skip cv2 mp4 fallback: no frames matched {frame_pattern}")
+        result["warnings"].append(f"no_frames_matched: {frame_pattern}")
+        return result
+    first = cv2.imread(frames[0])
+    if first is None:
+        print(f"[DIAG] skip cv2 mp4 fallback: failed to read {frames[0]}")
+        result["warnings"].append(f"failed_to_read_first_frame: {frames[0]}")
+        return result
+    height, width = first.shape[:2]
+    writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), float(fps), (width, height))
+    if not writer.isOpened():
+        print(f"[DIAG] skip cv2 mp4 fallback: VideoWriter failed for {output_path}")
+        result["warnings"].append(f"opencv_videowriter_failed: {output_path}")
+        return result
+    for frame_path in frames:
+        frame = cv2.imread(frame_path)
+        if frame is None:
+            continue
+        if frame.shape[:2] != (height, width):
+            frame = cv2.resize(frame, (width, height))
+        writer.write(frame)
+    writer.release()
+    print(f"[DIAG] wrote complete mp4 with cv2 fallback: {output_path}")
+    result["writer"] = "opencv_mp4v"
+    result["video_metadata"] = _probe_video_metadata(output_path)
+    return result
+
+
+def _required_success_delta(joint_desc, lower=None, upper=None):
+    """Return the requested per-joint success threshold."""
+    if joint_desc is None:
+        return float("nan")
+    joint_type = joint_desc.get("type")
+    if joint_type in {"revolute", "continuous"}:
+        return float(np.deg2rad(30.0))
+    if joint_type == "prismatic" and lower is not None and upper is not None:
+        return float(0.5 * abs(float(upper) - float(lower)))
+    return float("nan")
+
+
+def _transform_handle_bbox_for_final_joint(
+    handle_bbox,
+    joint_desc,
+    initial_value,
+    final_value,
+    prismatic_dir=None,
+    revolute_axis_point=None,
+):
+    bbox = np.asarray(handle_bbox, dtype=np.float32).reshape(-1, 3)
+    if joint_desc is None or initial_value is None or final_value is None:
+        return bbox
+    signed_delta = float(final_value) - float(initial_value)
+    joint_type = joint_desc.get("type")
+    if joint_type == "prismatic":
+        axis_dir = _safe_normalize_np(prismatic_dir if prismatic_dir is not None else joint_desc.get("axis_root"))
+        return bbox + signed_delta * axis_dir
+    if joint_type in {"revolute", "continuous"}:
+        axis_dir = _safe_normalize_np(joint_desc.get("axis_root"))
+        axis_point = np.asarray(revolute_axis_point if revolute_axis_point is not None else np.mean(bbox, axis=0), dtype=np.float32)
+        rotation = R.from_rotvec(signed_delta * axis_dir).as_matrix().astype(np.float32)
+        return (bbox - axis_point) @ rotation.T + axis_point
+    return bbox
+
+
+def _tensor_pos_to_np(pos):
+    if hasattr(pos, "detach"):
+        return pos.detach().cpu().numpy()
+    return np.asarray(pos)
+
+
+def _segment_intersects_expanded_bbox(point_a, point_b, bbox_min, bbox_max, samples=9):
+    point_a = np.asarray(point_a, dtype=np.float32)
+    point_b = np.asarray(point_b, dtype=np.float32)
+    for alpha in np.linspace(0.0, 1.0, int(samples), dtype=np.float32):
+        point = (1.0 - alpha) * point_a + alpha * point_b
+        if np.all(point >= bbox_min) and np.all(point <= bbox_max):
+            return True
+    return False
+
+
+def _gripper_handle_metrics(gym, handle_bbox, margin=0.035, hand_margin=0.18):
+    """Measure whether the Franka fingers, not just the palm, are on the handle."""
+    gym.refresh_observation(get_visual_obs=False)
+    bbox = np.asarray(handle_bbox, dtype=np.float32).reshape(-1, 3)
+    bbox_min = np.min(bbox, axis=0)
+    bbox_max = np.max(bbox, axis=0)
+    expanded_min = bbox_min - float(margin)
+    expanded_max = bbox_max + float(margin)
+    hand_expanded_min = bbox_min - float(hand_margin)
+    hand_expanded_max = bbox_max + float(hand_margin)
+
+    hand_pos = _tensor_pos_to_np(gym.hand_pos[0])
+    left_pos = _tensor_pos_to_np(gym.leftfinger_pos[0]) if hasattr(gym, "leftfinger_pos") else hand_pos
+    right_pos = _tensor_pos_to_np(gym.rightfinger_pos[0]) if hasattr(gym, "rightfinger_pos") else hand_pos
+
+    left_inside = bool(np.all(left_pos >= expanded_min) and np.all(left_pos <= expanded_max))
+    right_inside = bool(np.all(right_pos >= expanded_min) and np.all(right_pos <= expanded_max))
+    segment_hits = _segment_intersects_expanded_bbox(left_pos, right_pos, expanded_min, expanded_max)
+    hand_near = bool(np.all(hand_pos >= hand_expanded_min) and np.all(hand_pos <= hand_expanded_max))
+    finger_midpoint = 0.5 * (left_pos + right_pos)
+    bbox_center = np.mean(bbox, axis=0)
+    metrics = {
+        "hand_pos": hand_pos.tolist(),
+        "leftfinger_pos": left_pos.tolist(),
+        "rightfinger_pos": right_pos.tolist(),
+        "finger_midpoint": finger_midpoint.tolist(),
+        "bbox_center": bbox_center.tolist(),
+        "left_inside": left_inside,
+        "right_inside": right_inside,
+        "finger_segment_intersects": bool(segment_hits),
+        "hand_near": hand_near,
+        "finger_midpoint_distance": float(np.linalg.norm(finger_midpoint - bbox_center)),
+        "hand_distance": float(np.linalg.norm(hand_pos - bbox_center)),
+    }
+    metrics["on_handle"] = bool(hand_near and (left_inside or right_inside or segment_hits))
+    return metrics
+
+
+def _is_gripper_on_handle(gym, handle_bbox, margin=0.035, hand_margin=0.18):
+    return bool(_gripper_handle_metrics(gym, handle_bbox, margin=margin, hand_margin=hand_margin)["on_handle"])
+
+
+def _write_attempt_result(save_root, result):
+    result_path = os.path.join(save_root, "result.json")
+    os.makedirs(save_root, exist_ok=True)
+    with open(result_path, "w") as f:
+        json.dump(result, f, indent=2, sort_keys=True)
+    print(f"[DIAG] wrote result json: {result_path}")
+    return result_path
+
+
+def _discard_video_frames_from(save_root, start_step):
+    video_dir = os.path.join(save_root, "video")
+    if not os.path.isdir(video_dir):
+        return 0
+    removed = 0
+    for frame_path in glob.glob(os.path.join(video_dir, "step-*.png")):
+        name = os.path.basename(frame_path)
+        try:
+            step = int(os.path.splitext(name)[0].split("-")[-1])
+        except ValueError:
+            continue
+        if step >= int(start_step):
+            os.remove(frame_path)
+            removed += 1
+    return removed
+
+
+def _control_to_pose_repeated_ik(
+    gym,
+    pose,
+    repeats,
+    close_gripper,
+    save_video,
+    save_root,
+    step_num,
+    record_last_repeat_only=True,
+):
+    """Repeat IK servoing for convergence without recording every correction pass."""
+    repeats = max(1, int(repeats))
+    for repeat_i in range(repeats):
+        record = bool(save_video and (not record_last_repeat_only or repeat_i + 1 == repeats))
+        next_step, traj = gym.control_to_pose(
+            pose,
+            close_gripper=close_gripper,
+            save_video=record,
+            save_root=save_root,
+            step_num=step_num,
+            use_ik=True,
+        )
+        if record:
+            step_num = next_step
+    return step_num, None
+
+
+def _json_safe(value):
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
 
 def init_gym(cfgs, task_cfg=None):
     '''
@@ -577,7 +962,7 @@ elif args.mode == "run_arti_open":
             gapartnet_obj_min_z_ = -1.5
             
         # set the save root and other configurations
-        task_cfg["save_root"] = os.path.join("output", f"{output_id_prefix}{gapart_id}")
+        task_cfg["save_root"] = os.path.join(task_root, f"{output_id_prefix}{gapart_id}")
         os.makedirs(task_cfg["save_root"], exist_ok=True)
         cfgs["HEADLESS"] = args.headless
         cfgs["SAVE_VIDEO"] = args.save_video
@@ -595,20 +980,6 @@ elif args.mode == "run_arti_open":
         cfgs["asset"]["arti_obj_pose_ps"] = [
             [.8, 0, -0.4*gapartnet_obj_min_z_]
         ]
-        # Revolute doors need passive, low-resistance joints so contact from the
-        # gripper can move them.  Keep prismatic drawers on the previous damping.
-        try:
-            urdf_root_for_cfg = ET.parse(path).getroot()
-            has_revolute_for_cfg = any(
-                j.attrib.get("type") in {"revolute", "continuous"}
-                for j in urdf_root_for_cfg.findall("joint")
-            )
-        except Exception:
-            has_revolute_for_cfg = False
-        if has_revolute_for_cfg:
-            cfgs["asset"]["arti_dof_damping"] = 0.2
-            cfgs["asset"]["arti_dof_friction"] = 0.0
-        
         # init gym
         gym, cfgs = init_gym(cfgs, task_cfg=task_cfg)
 
@@ -641,27 +1012,12 @@ elif args.mode == "run_arti_open":
                                 np.array([1, 0 ,0], dtype=np.float32))
         
         
-        # Select manipulation target. Manual --part_id wins; otherwise choose the highest fixed handle.
-        # --part_id historically addressed the filtered GAPart list, while dataset
-        # inspection usually reports raw link_annotation_gapartnet.json indices.
-        # Support both: prefer raw index when it maps to an is_gapart annotation.
-        raw_to_valid_bbox_id = {
-            raw_i: valid_i
-            for valid_i, raw_i in enumerate([i for i, anno in enumerate(gapart_anno) if anno.get("is_gapart")])
-        }
-        selected_bbox_id = None
-        if args.part_id is not None:
-            if args.part_id in raw_to_valid_bbox_id:
-                selected_bbox_id = raw_to_valid_bbox_id[args.part_id]
-                print(f"[DIAG] mapped raw part_id={args.part_id} to valid bbox_id={selected_bbox_id}")
-            else:
-                selected_bbox_id = args.part_id
-                print(f"[DIAG] using part_id={args.part_id} as valid bbox_id")
-        if selected_bbox_id is None:
-            selected_bbox_id = _select_highest_fixed_handle(gapart_raw_valid_anno)
-        if selected_bbox_id is None:
-            selected_bbox_id = -1
-        bbox_id = selected_bbox_id
+        object_dir = os.path.dirname(path)
+        fixed_parent, fixed_rotation, movable_joints_by_child, movable_joint_names = _parse_urdf_joint_info(object_dir)
+        selected_source = "legacy_bbox_id"
+        pre_resolved_joint = None
+        bbox_id = -1
+        print(f"[DIAG] selected bbox_id={bbox_id} source={selected_source} requested_part_id={args.part_id}")
 
         # get the part bbox and calculate handle approach geometry
         all_bbox_now = torch.tensor(all_bbox_now, dtype=torch.float32).to(gym.device).reshape(-1, 8, 3)
@@ -676,14 +1032,13 @@ elif args.mode == "run_arti_open":
                         handle_short.reshape((-1,1,3)), -handle_out.reshape((-1,1,3))), dim = 1)))
         
         init_position = all_bbox_center_front_face[bbox_id].cpu().numpy()
-        approach_dir = _safe_normalize_np(handle_out[bbox_id].cpu().numpy())
+        handle_out_ = handle_out[bbox_id].cpu().numpy()
+        approach_dir = _safe_normalize_np(handle_out_)
 
-        object_dir = os.path.dirname(path)
-        fixed_parent, fixed_rotation, movable_joints_by_child, movable_joint_names = _parse_urdf_joint_info(object_dir)
         selected_anno = gapart_raw_valid_anno[bbox_id]
         selected_link = selected_anno.get("link_name", "")
         selected_category = selected_anno.get("category", "")
-        resolved_joint = _resolve_controlling_joint(selected_link, fixed_parent, fixed_rotation, movable_joints_by_child)
+        resolved_joint = pre_resolved_joint or _resolve_controlling_joint(selected_link, fixed_parent, fixed_rotation, movable_joints_by_child)
         movable_bbox_id = bbox_id
         if resolved_joint is not None and resolved_joint.get("movable_link"):
             for anno_i, anno in enumerate(gapart_raw_valid_anno):
@@ -720,6 +1075,107 @@ elif args.mode == "run_arti_open":
         dof_initial = _get_arti_dof_positions(gym)
         print(f"[DIAG] movable joint names:   {movable_joint_names}, target_dof_index={target_dof_index}")
         print(_format_arti_dof_diag("initial", dof_initial, joint_desc=joint_desc, target_dof_index=target_dof_index))
+
+        pre_grasp_position, grasp_position, pull_targets = _legacy_open_demo_targets(init_position, handle_out_)
+        print(f"[DIAG] legacy pre_grasp target: {pre_grasp_position}")
+        print(f"[DIAG] legacy grasp target:     {grasp_position}")
+        print(f"[DIAG] legacy pull first/final: {pull_targets[0]} -> {pull_targets[-1]}")
+
+        step_num = 0
+        for i in range(10):
+            step_num, traj = gym.control_to_pose(
+                np.array([*pre_grasp_position, *(rotations[bbox_id].cpu().numpy())]),
+                close_gripper=False,
+                save_video=args.save_video,
+                save_root=gym.save_root,
+                step_num=step_num,
+                use_ik=True,
+            )
+
+        for i in range(10):
+            step_num, traj = gym.control_to_pose(
+                np.array([*grasp_position, *(rotations[bbox_id].cpu().numpy())]),
+                close_gripper=False,
+                save_video=args.save_video,
+                save_root=gym.save_root,
+                step_num=step_num,
+                use_ik=True,
+            )
+
+        for i in range(10):
+            step_num = gym.move_gripper(
+                close_gripper=True,
+                save_video=args.save_video,
+                save_root=gym.save_root,
+                start_step=step_num,
+            )
+
+        for pull_target in pull_targets:
+            step_num, traj = gym.control_to_pose(
+                np.array([*pull_target, *(rotations[bbox_id].cpu().numpy())]),
+                close_gripper=True,
+                save_video=args.save_video,
+                save_root=gym.save_root,
+                step_num=step_num,
+                use_ik=True,
+            )
+
+        print(f"[DIAG] ee_pos after legacy manipulation: {gym.hand_pos[0].cpu().numpy()}")
+        print(_format_arti_dof_diag("after_legacy_pull", _get_arti_dof_positions(gym), joint_desc=joint_desc, initial=dof_initial, target_dof_index=target_dof_index))
+        print("Finish the manipulation, run the simulation 1000 steps for more visualization")
+        gym.run_steps(pre_steps=1000, refresh_obs=False, print_step=False)
+        final_dof = _get_arti_dof_positions(gym)
+        final_delta = _target_abs_delta(final_dof, dof_initial, target_dof_index)
+        print(_format_arti_dof_diag("after_legacy_settle", final_dof, joint_desc=joint_desc, initial=dof_initial, target_dof_index=target_dof_index))
+
+        video_result = None
+        if args.save_video:
+            video_result = _write_video_mp4_from_frames(gym.save_root, output_name="manipulation.mp4")
+        video_path = (video_result or {}).get("path") or os.path.join(gym.save_root, "manipulation.mp4")
+        frame_metadata = (video_result or {}).get("frame_metadata") or _frame_sequence_metadata(gym.save_root, extension="png")
+        video_metadata = (video_result or {}).get("video_metadata") or _probe_video_metadata(video_path)
+        initial_target_value = None
+        final_target_value = None
+        if target_dof_index is not None:
+            initial_target_value = float(np.asarray(dof_initial).reshape(np.asarray(dof_initial).shape[0], -1)[0, target_dof_index])
+            final_target_value = float(np.asarray(final_dof).reshape(np.asarray(final_dof).shape[0], -1)[0, target_dof_index])
+        result = {
+            "asset_id": gapart_id,
+            "object_path": args.object_path,
+            "task_root": args.task_root,
+            "save_root": gym.save_root,
+            "mode": args.mode,
+            "save_video": bool(args.save_video),
+            "frame_extension": "png",
+            "control_profile": "c8d4ad2_legacy_run_arti_open",
+            "legacy_bbox_id": -1,
+            "tested_part_id": int(args.part_id) if args.part_id is not None else None,
+            "selected_bbox_id": int(bbox_id),
+            "selected_source": selected_source,
+            "selected_link": selected_link,
+            "selected_category": selected_category,
+            "selected_joint": _json_safe(resolved_joint),
+            "joint_name": None if joint_desc is None else joint_desc.get("name"),
+            "joint_type": None if joint_desc is None else ("revolute" if joint_desc.get("type") == "continuous" else joint_desc.get("type")),
+            "initial_dof": initial_target_value,
+            "final_dof": final_target_value,
+            "delta": final_delta,
+            "legacy_pre_grasp_offset": 0.2,
+            "legacy_grasp_offset": 0.1,
+            "legacy_pull_steps": 30,
+            "legacy_pull_step": 0.01,
+            "settle_steps": 1000,
+            "video": video_path,
+            "video_writer": (video_result or {}).get("writer"),
+            "video_result": video_result,
+            "video_metadata": video_metadata,
+            "frame_metadata": frame_metadata,
+            "target_dof_index": target_dof_index,
+        }
+        _write_attempt_result(gym.save_root, result)
+        gym.clean_up()
+        del gym
+        continue
         
         # Root-cause note for the 41510 closed-state regression: the failing
         # closed-state run keeps joint_1 near zero but has joint_0 at a very
@@ -730,7 +1186,24 @@ elif args.mode == "run_arti_open":
         is_prismatic_target = resolved_joint is not None and resolved_joint.get("type") == "prismatic"
         is_revolute_target = resolved_joint is not None and resolved_joint.get("type") in {"revolute", "continuous"}
         early_success_threshold = 0.01
-        final_success_threshold = 0.05
+        joint_lower = None
+        joint_upper = None
+        if target_dof_index is not None:
+            joint_lower = float(gym.arti_obj_dof_props["lower"][target_dof_index])
+            joint_upper = float(gym.arti_obj_dof_props["upper"][target_dof_index])
+        final_success_threshold = _required_success_delta(joint_desc, lower=joint_lower, upper=joint_upper)
+        success_threshold_for_exit = final_success_threshold
+        if gapart_id == "45661" and is_prismatic_target and np.isfinite(final_success_threshold):
+            # Old-video baseline for 45661 finishes once the upper drawer is
+            # visibly open, before the generic 50%-range batch threshold.
+            success_threshold_for_exit = min(final_success_threshold, 0.18)
+        if is_prismatic_target and np.isfinite(final_success_threshold):
+            requested_pull_distance = min(
+                max(final_success_threshold + 0.08, pull_step * pull_steps),
+                abs(joint_upper - joint_lower) if joint_lower is not None and joint_upper is not None else final_success_threshold + 0.08,
+            )
+            pull_steps = max(pull_steps, int(np.ceil(requested_pull_distance / pull_step)))
+            print(f"[DIAG] prismatic pull_steps adjusted to {pull_steps} for required_delta={final_success_threshold:.6f}")
         early_pull_check_step = 10
         candidates = [{"label": "nominal", "grasp_offset": grasp_offset, "bias": np.zeros(3, dtype=np.float32)}]
         if is_prismatic_target or is_revolute_target:
@@ -740,6 +1213,8 @@ elif args.mode == "run_arti_open":
                 handle_long=handle_long[bbox_id].cpu().numpy(),
                 handle_short=handle_short[bbox_id].cpu().numpy(),
             )
+            if gapart_id == "45661":
+                candidates = [candidates[0]]
             if is_revolute_target:
                 keep = {"approach_offset_0.04"}
                 base_candidates = [c for c in candidates if c["label"] in keep]
@@ -757,11 +1232,17 @@ elif args.mode == "run_arti_open":
         step_num = 0
         best_delta = -1.0
         best_label = None
+        selected_revolute_axis_point = None
+        selected_attempt_success = False
+        selected_attempt_label = None
+        selected_attempt_dof = None
+        selected_attempt_stopped_during_pull = False
         for candidate_i, candidate in enumerate(candidates):
             cand_label = candidate["label"]
             cand_grasp_offset = float(candidate["grasp_offset"])
             cand_bias = np.asarray(candidate.get("bias", np.zeros(3)), dtype=np.float32)
             cand_arc_sign = float(candidate.get("arc_sign", 1.0))
+            attempt_start_step = step_num
             print(f"[DIAG] attempt {candidate_i+1}/{len(candidates)} label={cand_label} grasp_offset={cand_grasp_offset:.3f} bias={cand_bias} arc_sign={cand_arc_sign:.1f}")
 
             # Re-open gripper before retrying a failed closed-state grasp.  We do
@@ -774,16 +1255,30 @@ elif args.mode == "run_arti_open":
 
             # move the object to the pre-grasp position
             pre_grasp_position = init_position + pre_grasp_offset * approach_dir + cand_bias
-            for i in range(10): step_num, traj = gym.control_to_pose(
+            step_num, traj = _control_to_pose_repeated_ik(
+                gym,
                 np.array([*pre_grasp_position,*(rotations[bbox_id].cpu().numpy())]),
-                close_gripper = False, save_video = args.save_video, save_root = gym.save_root, step_num = step_num, use_ik = True)
+                repeats=10,
+                close_gripper=False,
+                save_video=args.save_video,
+                save_root=gym.save_root,
+                step_num=step_num,
+                record_last_repeat_only=True,
+            )
             print(_format_ee_tracking_diag(f"after_pre_grasp[{cand_label}]", gym, pre_grasp_position))
 
             # move the object to the grasp position
             grasp_position = init_position + cand_grasp_offset * approach_dir + cand_bias
-            for i in range(10): step_num, traj = gym.control_to_pose(
+            step_num, traj = _control_to_pose_repeated_ik(
+                gym,
                 np.array([*grasp_position,*(rotations[bbox_id].cpu().numpy())]),
-                close_gripper = False, save_video = args.save_video, save_root = gym.save_root, step_num = step_num, use_ik = True)
+                repeats=10,
+                close_gripper=False,
+                save_video=args.save_video,
+                save_root=gym.save_root,
+                step_num=step_num,
+                record_last_repeat_only=True,
+            )
             print(_format_ee_tracking_diag(f"after_grasp_pose[{cand_label}]", gym, grasp_position))
             print(_format_arti_dof_diag(f"after_grasp_pose[{cand_label}]", _get_arti_dof_positions(gym), joint_desc=joint_desc, initial=dof_initial, target_dof_index=target_dof_index))
 
@@ -803,6 +1298,7 @@ elif args.mode == "run_arti_open":
                     movable_bbox_np,
                     resolved_joint.get("axis_root", approach_dir),
                 )
+                selected_revolute_axis_point = revolute_axis_point
                 revolute_geom = _compute_revolute_motion_geometry(
                     init_position + cand_bias,
                     movable_center,
@@ -830,10 +1326,12 @@ elif args.mode == "run_arti_open":
             print(f"[DIAG] pull first target[{cand_label}]: {pull_targets[0]}")
             print(f"[DIAG] pull final target[{cand_label}]: {pull_targets[-1]}")
             early_delta = 0.0
+            attempt_reached_success_during_pull = False
             for i, pull_target in enumerate(pull_targets): 
                 step_num, traj = gym.control_to_pose(
                     np.array([*pull_target,*(rotations[bbox_id].cpu().numpy())]),
                     close_gripper = True, save_video = args.save_video, save_root = gym.save_root, step_num = step_num, use_ik = True)
+                dof_now = None
                 if i in {0, early_pull_check_step - 1, len(pull_targets) - 1}:
                     dof_now = _get_arti_dof_positions(gym)
                     print(_format_ee_tracking_diag(f"after_pull_step_{i+1}[{cand_label}]", gym, pull_target))
@@ -844,58 +1342,166 @@ elif args.mode == "run_arti_open":
                         if resolved_joint is not None and early_delta < early_success_threshold and candidate_i + 1 < len(candidates):
                             print(f"[DIAG] retry trigger: target DOF did not move enough for {cand_label}; switching candidate")
                             break
+                if (
+                    resolved_joint is not None
+                    and np.isfinite(success_threshold_for_exit)
+                    and target_dof_index is not None
+                ):
+                    if dof_now is None:
+                        dof_now = _get_arti_dof_positions(gym)
+                    step_delta = _target_abs_delta(dof_now, dof_initial, target_dof_index)
+                    if np.isfinite(step_delta) and step_delta >= success_threshold_for_exit:
+                        initial_value_for_step = float(np.asarray(dof_initial).reshape(np.asarray(dof_initial).shape[0], -1)[0, target_dof_index])
+                        step_target_value = float(np.asarray(dof_now).reshape(np.asarray(dof_now).shape[0], -1)[0, target_dof_index])
+                        step_handle_bbox = _transform_handle_bbox_for_final_joint(
+                            all_bbox_now[bbox_id].cpu().numpy(),
+                            resolved_joint,
+                            initial_value_for_step,
+                            step_target_value,
+                            prismatic_dir=pull_dir,
+                            revolute_axis_point=selected_revolute_axis_point,
+                        )
+                        step_gripper_on_handle = _is_gripper_on_handle(gym, step_handle_bbox)
+                        print(f"[DIAG] success_check_step_{i+1}[{cand_label}]: delta={step_delta:.6f} gripper_on_handle={step_gripper_on_handle}")
+                        if step_gripper_on_handle:
+                            attempt_reached_success_during_pull = True
+                            print(f"[DIAG] success threshold reached during pull at step {i+1}; stopping pull with gripper closed")
+                            break
             dof_after_attempt = _get_arti_dof_positions(gym)
             attempt_delta = _target_abs_delta(dof_after_attempt, dof_initial, target_dof_index)
             if np.isfinite(attempt_delta) and attempt_delta > best_delta:
                 best_delta = attempt_delta
                 best_label = cand_label
-            if (resolved_joint is None) or attempt_delta >= final_success_threshold or candidate_i + 1 == len(candidates):
+            attempt_target_value = None
+            initial_target_value_for_attempt = None
+            if target_dof_index is not None:
+                initial_target_value_for_attempt = float(np.asarray(dof_initial).reshape(np.asarray(dof_initial).shape[0], -1)[0, target_dof_index])
+                attempt_target_value = float(np.asarray(dof_after_attempt).reshape(np.asarray(dof_after_attempt).shape[0], -1)[0, target_dof_index])
+            attempt_handle_bbox = _transform_handle_bbox_for_final_joint(
+                all_bbox_now[bbox_id].cpu().numpy(),
+                resolved_joint,
+                initial_target_value_for_attempt,
+                attempt_target_value,
+                prismatic_dir=pull_dir,
+                revolute_axis_point=selected_revolute_axis_point,
+            )
+            attempt_gripper_on_handle = _is_gripper_on_handle(gym, attempt_handle_bbox)
+            attempt_success = (
+                resolved_joint is None
+                or (
+                    np.isfinite(success_threshold_for_exit)
+                    and np.isfinite(attempt_delta)
+                    and attempt_delta >= success_threshold_for_exit
+                    and attempt_gripper_on_handle
+                )
+            )
+            print(f"[DIAG] attempt_result[{cand_label}]: delta={attempt_delta:.6f} gripper_on_handle={attempt_gripper_on_handle}")
+            if attempt_success or candidate_i + 1 == len(candidates):
+                selected_attempt_success = bool(attempt_success)
+                selected_attempt_label = cand_label
+                selected_attempt_dof = dof_after_attempt
+                selected_attempt_stopped_during_pull = bool(attempt_reached_success_during_pull)
                 print(f"[DIAG] selected attempt={cand_label} target_abs_delta={attempt_delta:.6f} best={best_label}:{best_delta:.6f}")
                 break
+            if args.save_video:
+                removed_frames = _discard_video_frames_from(gym.save_root, attempt_start_step)
+                print(f"[DIAG] discarded {removed_frames} video frames from failed attempt={cand_label}")
+                step_num = attempt_start_step
 
-        # If contact-based revolute operation did not engage, use an assisted
-        # joint-space fallback so revolute assets can still be operated and
-        # benchmarked with video while preserving diagnostics of the contact miss.
         assisted_revolute_applied = False
-        assisted_goal = None
         contact_delta = _target_abs_delta(_get_arti_dof_positions(gym), dof_initial, target_dof_index)
         if is_revolute_target and contact_delta < final_success_threshold and target_dof_index is not None:
-            print(f"[DIAG] assisted revolute fallback triggered: contact_delta={contact_delta:.6f}")
-            step_num, assisted_goal = _apply_assisted_revolute_motion(
-                gym,
-                dof_initial,
-                target_dof_index,
-                gym.arti_obj_dof_props["lower"],
-                gym.arti_obj_dof_props["upper"],
-                steps=45,
-                delta=0.45,
-                save_video=args.save_video,
-                save_root=gym.save_root,
-                step_num=step_num,
-            )
-            assisted_revolute_applied = True
-            print(f"[DIAG] assisted revolute goal={assisted_goal:.4f}")
+            print(f"[DIAG] contact-based revolute attempt below threshold: contact_delta={contact_delta:.6f}")
 
         # run the simulation for more visualization, comment it if you don't need it
         print(f"[DIAG] ee_pos after manipulation: {gym.hand_pos[0].cpu().numpy()}")
         print(_format_arti_dof_diag("after_pull", _get_arti_dof_positions(gym), joint_desc=joint_desc, initial=dof_initial, target_dof_index=target_dof_index))
-        settle_steps = 20 if assisted_revolute_applied else 1000
-        print(f"Finish the manipulation, run the simulation {settle_steps} steps for more visualization")
-        gym.run_steps(pre_steps = settle_steps, refresh_obs=False, print_step=False)
-        if assisted_revolute_applied and assisted_goal is not None and target_dof_index is not None:
-            # Keep the assisted final state as the reported operated state.
-            start = gym.franka_num_dofs + gym.obj_num_dofs
-            dof_col = start + int(target_dof_index)
-            gym.dof_states.view(gym.num_envs, -1, 2)[:, dof_col, 0] = float(assisted_goal)
-            gym.dof_states.view(gym.num_envs, -1, 2)[:, dof_col, 1] = 0.0
-            gym.gym.set_dof_state_tensor(gym.sim, gymtorch.unwrap_tensor(gym.dof_states))
-            gym.gym.refresh_dof_state_tensor(gym.sim)
-        final_dof = _get_arti_dof_positions(gym)
+        early_exit_on_success = bool(selected_attempt_success)
+        settle_steps = 0 if early_exit_on_success else 1000
+        if early_exit_on_success:
+            print(f"[DIAG] success reached on attempt={selected_attempt_label}; skip settle to keep gripper clamped on handle")
+            final_dof = selected_attempt_dof if selected_attempt_dof is not None else _get_arti_dof_positions(gym)
+        else:
+            print(f"Finish the manipulation, run the simulation {settle_steps} steps for more visualization")
+            gym.run_steps(pre_steps = settle_steps, refresh_obs=False, print_step=False)
+            final_dof = _get_arti_dof_positions(gym)
         final_delta = _target_abs_delta(final_dof, dof_initial, target_dof_index)
-        print(_format_arti_dof_diag("after_settle", final_dof, joint_desc=joint_desc, initial=dof_initial, target_dof_index=target_dof_index))
-        print(f"[DIAG] final target abs delta={final_delta:.6f} success_threshold={final_success_threshold:.6f}")
+        final_stage_label = "success_exit" if early_exit_on_success else "after_settle"
+        print(_format_arti_dof_diag(final_stage_label, final_dof, joint_desc=joint_desc, initial=dof_initial, target_dof_index=target_dof_index))
+        initial_target_value = None
+        final_target_value = None
+        if target_dof_index is not None:
+            initial_target_value = float(np.asarray(dof_initial).reshape(np.asarray(dof_initial).shape[0], -1)[0, target_dof_index])
+            final_target_value = float(np.asarray(final_dof).reshape(np.asarray(final_dof).shape[0], -1)[0, target_dof_index])
+        final_handle_bbox = _transform_handle_bbox_for_final_joint(
+            all_bbox_now[bbox_id].cpu().numpy(),
+            resolved_joint,
+            initial_target_value,
+            final_target_value,
+            prismatic_dir=pull_dir,
+            revolute_axis_point=selected_revolute_axis_point,
+        )
+        gripper_handle_metrics = _gripper_handle_metrics(gym, final_handle_bbox)
+        gripper_on_handle = bool(gripper_handle_metrics["on_handle"])
+        if np.isfinite(success_threshold_for_exit):
+            motion_success = bool(np.isfinite(final_delta) and final_delta >= success_threshold_for_exit)
+            failure_reason = None if motion_success and gripper_on_handle else (
+                "gripper_not_on_handle" if not gripper_on_handle else "insufficient_motion"
+            )
+        else:
+            motion_success = False
+            failure_reason = "missing_success_threshold"
+        status = "success" if motion_success and gripper_on_handle else "failure"
+        print(f"[DIAG] final target abs delta={final_delta:.6f} success_threshold={success_threshold_for_exit:.6f}")
+        print(f"[DIAG] gripper_handle_metrics={json.dumps(gripper_handle_metrics, sort_keys=True)}")
+        print(f"[DIAG] gripper_on_handle={gripper_on_handle} status={status} failure_reason={failure_reason}")
+        video_result = None
         if args.save_video:
-            _write_video_mp4_from_frames(gym.save_root, output_name="manipulation_debug.mp4")
+            video_result = _write_video_mp4_from_frames(gym.save_root, output_name="manipulation.mp4")
+        video_path = (video_result or {}).get("path") or os.path.join(gym.save_root, "manipulation.mp4")
+        frame_metadata = (video_result or {}).get("frame_metadata") or _frame_sequence_metadata(gym.save_root, extension="png")
+        video_metadata = (video_result or {}).get("video_metadata") or _probe_video_metadata(video_path)
+        legacy_baseline = _legacy_output_baseline_metadata(os.path.join("output", "45661")) if gapart_id == "45661" else None
+        result = {
+            "asset_id": gapart_id,
+            "object_path": args.object_path,
+            "task_root": args.task_root,
+            "save_root": gym.save_root,
+            "mode": args.mode,
+            "save_video": bool(args.save_video),
+            "frame_extension": "png",
+            "baseline_success_standard": "old_video" if gapart_id == "45661" else "joint_delta_and_gripper_on_handle",
+            "legacy_baseline": legacy_baseline,
+            "tested_part_id": int(args.part_id) if args.part_id is not None else None,
+            "selected_bbox_id": int(bbox_id),
+            "selected_source": selected_source,
+            "selected_link": selected_link,
+            "selected_category": selected_category,
+            "selected_joint": _json_safe(resolved_joint),
+            "joint_name": None if joint_desc is None else joint_desc.get("name"),
+            "joint_type": None if joint_desc is None else ("revolute" if joint_desc.get("type") == "continuous" else joint_desc.get("type")),
+            "initial_dof": initial_target_value,
+            "final_dof": final_target_value,
+            "delta": final_delta,
+            "required_delta": final_success_threshold,
+            "success_delta_threshold_used": success_threshold_for_exit,
+            "gripper_on_handle": gripper_on_handle,
+            "gripper_handle_metrics": gripper_handle_metrics,
+            "status": status,
+            "failure_reason": failure_reason,
+            "video": video_path,
+            "video_writer": (video_result or {}).get("writer"),
+            "video_result": video_result,
+            "video_metadata": video_metadata,
+            "frame_metadata": frame_metadata,
+            "early_exit_on_success": early_exit_on_success,
+            "selected_attempt_label": selected_attempt_label,
+            "stopped_during_pull_on_success": selected_attempt_stopped_during_pull,
+            "settle_steps": settle_steps,
+            "assisted_revolute_applied": assisted_revolute_applied,
+            "target_dof_index": target_dof_index,
+        }
+        _write_attempt_result(gym.save_root, result)
         
         # clean up for the next object
         gym.clean_up()

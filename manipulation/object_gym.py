@@ -49,10 +49,9 @@ if False:
 
 
 def _closed_dof_positions(lower, upper):
-    """Return closed/default articulated DOF positions: zero clipped into each joint limit."""
+    """Return the legacy default articulated DOF positions from c8d4ad2."""
     lower = np.asarray(lower, dtype=np.float32)
-    upper = np.asarray(upper, dtype=np.float32)
-    return np.clip(np.zeros_like(lower, dtype=np.float32), lower, upper)
+    return lower.copy()
 
 
 class ObjectGym():
@@ -400,6 +399,8 @@ class ObjectGym():
         self.franka_num_links = len(franka_link_dict)
         # print("franka dof:", self.franka_num_dofs, "franka links:", self.franka_num_links)
         self.franka_hand_index = franka_link_dict["panda_hand"]
+        self.franka_leftfinger_index = franka_link_dict.get("panda_leftfinger")
+        self.franka_rightfinger_index = franka_link_dict.get("panda_rightfinger")
 
     # used
     def prepare_obj_assets(self):
@@ -453,7 +454,7 @@ class ObjectGym():
         arti_obj_asset_options.vhacd_params = gymapi.VhacdParams()
         arti_obj_asset_options.vhacd_params.resolution = 100000 # 1000000
         arti_obj_asset_options.default_dof_drive_mode = gymapi.DOF_MODE_NONE
-        arti_obj_asset_options.disable_gravity = self.cfgs["asset"].get("arti_disable_gravity", True)
+        arti_obj_asset_options.disable_gravity = self.cfgs["asset"].get("arti_disable_gravity", False)
         arti_obj_asset_options.flip_visual_attachments = False
         
         # unused settings, be careful, otherwise it will cause error
@@ -501,6 +502,8 @@ class ObjectGym():
         self.envs = []
         self.obj_actor_idxs = []
         self.hand_idxs = []
+        self.leftfinger_idxs = []
+        self.rightfinger_idxs = []
         self.init_franka_pos_list = []
         self.init_franka_rot_list = []
         self.init_obj_pos_list = []
@@ -571,6 +574,10 @@ class ObjectGym():
             # get global index of hand in rigid body state tensor
             hand_idx = self.gym.find_actor_rigid_body_index(env, franka_handle, "panda_hand", gymapi.DOMAIN_SIM)
             self.hand_idxs.append(hand_idx)
+            leftfinger_idx = self.gym.find_actor_rigid_body_index(env, franka_handle, "panda_leftfinger", gymapi.DOMAIN_SIM)
+            rightfinger_idx = self.gym.find_actor_rigid_body_index(env, franka_handle, "panda_rightfinger", gymapi.DOMAIN_SIM)
+            self.leftfinger_idxs.append(leftfinger_idx)
+            self.rightfinger_idxs.append(rightfinger_idx)
             
             ### Table
             self.table_handle = self.gym.create_actor(env, self.table_asset, self.table_pose, "table", i, 0, self.table_seg_id)
@@ -612,10 +619,6 @@ class ObjectGym():
                 self.arti_init_obj_pos_list.append([arti_initial_pose.p.x, arti_initial_pose.p.y, arti_initial_pose.p.z])
                 self.arti_init_obj_rot_list.append([arti_initial_pose.r.x, arti_initial_pose.r.y, arti_initial_pose.r.z, arti_initial_pose.r.w])
                 arti_obj_actor_handle = self.gym.create_actor(env, self.arti_obj_asset, arti_initial_pose, 'arti_actor', i, 1, 0) #1, self.asset_seg_ids[-1] + 1
-                # Scale immediately after actor creation.  Setting scale after DOF
-                # states can cause IsaacGym to rebuild articulation transforms and
-                # lose/shift the requested closed DOF pose for revolute assets.
-                self.gym.set_actor_scale(env, arti_obj_actor_handle, self.cfgs["asset"]["arti_obj_scale"])
                 
                 self.gym.set_actor_dof_properties(env, arti_obj_actor_handle, self.arti_obj_dof_props)
                 # set initial dof states
@@ -626,6 +629,7 @@ class ObjectGym():
                 self.gym.set_actor_dof_position_targets(env, arti_obj_actor_handle, self.arti_obj_default_dof_state["pos"])
                 arti_obj_actor_idx = self.gym.get_actor_rigid_body_index(env, arti_obj_actor_handle, 0, gymapi.DOMAIN_SIM)
                 self.arti_obj_actor_idxs.append(arti_obj_actor_idx)
+                self.gym.set_actor_scale(env, arti_obj_actor_handle, self.cfgs["asset"]["arti_obj_scale"])
                 
                 agent_shape_props = self.gym.get_actor_rigid_shape_properties(env, arti_obj_actor_handle)
                 for agent_shape_prop in agent_shape_props:
@@ -744,7 +748,7 @@ class ObjectGym():
                 self.gym.render_all_camera_sensors(self.sim)
                 step_str = str(start_step + step_i).zfill(4)
                 os.makedirs(f"{save_root}/video", exist_ok=True)
-                self.gym.write_camera_image_to_file(self.sim, self.envs[0], self.cams[0][0], gymapi.IMAGE_COLOR, f"{save_root}/video/step-{step_str}.png")
+                self.save_camera_frame(f"{save_root}/video/step-{step_str}.png")
 
     def init_observation(self):
         # get jacobian tensor
@@ -798,6 +802,8 @@ class ObjectGym():
         self.hand_pos = self.rb_states[self.hand_idxs, :3]
         self.hand_rot = self.rb_states[self.hand_idxs, 3:7]
         self.hand_vel = self.rb_states[self.hand_idxs, 7:]
+        self.leftfinger_pos = self.rb_states[self.leftfinger_idxs, :3]
+        self.rightfinger_pos = self.rb_states[self.rightfinger_idxs, :3]
 
         ### TODO: support different dof tensor shapes in different envs
         self.robot_dof_qpos_qvel = self.dof_states.reshape(self.num_envs,-1,2)[:,:self.franka_num_dofs, :].view(self.num_envs, self.franka_num_dofs, 2)
@@ -1052,7 +1058,7 @@ class ObjectGym():
                 # print("Saving video frame:", start_step + step_i)
                 step_str = str(start_step + step_i).zfill(4)
                 os.makedirs(f"{save_root}/video", exist_ok=True)
-                self.gym.write_camera_image_to_file(self.sim, self.envs[0], self.cams[0][0], gymapi.IMAGE_COLOR, f"{save_root}/video/step-{step_str}.png")
+                self.save_camera_frame(f"{save_root}/video/step-{step_str}.png")
                 # self.gym.write_viewer_image_to_file(self.viewer, f"{save_root}/step-{start_step + step_i}.png")
           
     def move_gripper(self, close_gripper = True, save_video = False, save_root = "", start_step = 0):
@@ -1075,8 +1081,11 @@ class ObjectGym():
             # start_step string, 4 digit
             step_str = str(start_step).zfill(4)
             os.makedirs(f"{save_root}/video", exist_ok=True)
-            self.gym.write_camera_image_to_file(self.sim, self.envs[0], self.cams[0][0], gymapi.IMAGE_COLOR, f"{save_root}/video/step-{step_str}.png")
+            self.save_camera_frame(f"{save_root}/video/step-{step_str}.png")
         return start_step + 1
+
+    def save_camera_frame(self, path):
+        self.gym.write_camera_image_to_file(self.sim, self.envs[0], self.cams[0][0], gymapi.IMAGE_COLOR, path)
         
     def control_to_pose(self, pose, close_gripper = True, save_video = False, save_root = "", step_num = 0, use_ik = False, start_qpos = None):
         # move to pre-grasp
