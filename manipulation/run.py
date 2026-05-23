@@ -380,6 +380,14 @@ def _legacy_open_demo_targets(init_position, handle_out):
     return pre_grasp_position, grasp_position, pull_targets
 
 
+def _pose_z_for_support_surface_height(min_z, scale=0.4, support_surface_z=0.43):
+    return float(support_surface_z) - float(scale) * float(min_z)
+
+
+def _support_surface_z_for_asset(gapart_id):
+    return 0.43 if str(gapart_id) == "27044" else 0.0
+
+
 def _get_arti_dof_positions(gym):
     """Read articulated-object DOF positions from the global DOF tensor."""
     gym.refresh_observation(get_visual_obs=False)
@@ -389,6 +397,41 @@ def _get_arti_dof_positions(gym):
     if hasattr(arti_dof_pos, "detach"):
         arti_dof_pos = arti_dof_pos.detach().cpu().numpy()
     return np.asarray(arti_dof_pos, dtype=np.float32)
+
+
+def _closed_arti_dof_state_command(dof_states, franka_num_dofs, obj_num_dofs, arti_lower):
+    """Return DOF states with articulated-object positions reset to closed limits."""
+    updated = dof_states.copy() if hasattr(dof_states, "copy") else dof_states.clone()
+    start = int(franka_num_dofs) + int(obj_num_dofs)
+    lower_np = np.asarray(arti_lower, dtype=np.float32)
+    end = start + lower_np.size
+    if hasattr(updated, "new_tensor"):
+        lower = updated.new_tensor(lower_np)
+    else:
+        lower = lower_np
+    updated[:, start:end, 0] = lower
+    updated[:, start:end, 1] = 0.0
+    return updated
+
+
+def _reset_arti_dofs_to_closed(gym):
+    """Force articulated-object DOFs closed after simulator warmup drift."""
+    if not hasattr(gym, "arti_obj_dof_props") or gym.arti_obj_num_dofs <= 0:
+        return None
+    gym.refresh_observation(get_visual_obs=False)
+    lower = np.asarray(gym.arti_obj_dof_props["lower"], dtype=np.float32)
+    dof_view = gym.dof_states.view(gym.num_envs, -1, 2)
+    closed = _closed_arti_dof_state_command(
+        dof_view,
+        franka_num_dofs=gym.franka_num_dofs,
+        obj_num_dofs=gym.obj_num_dofs,
+        arti_lower=lower,
+    )
+    dof_view[:, :, :] = closed
+    gym.gym.set_dof_state_tensor(gym.sim, gymtorch.unwrap_tensor(gym.dof_states))
+    gym.gym.refresh_dof_state_tensor(gym.sim)
+    gym.refresh_observation(get_visual_obs=False)
+    return lower.copy()
 
 
 def _select_target_dof_index(joint_desc, movable_joint_names):
@@ -864,6 +907,7 @@ def init_gym(cfgs, task_cfg=None):
     gym.refresh_observation(get_visual_obs=False)
     gym.run_steps(pre_steps = 10, refresh_obs=False, print_step=False)
     gym.refresh_observation(get_visual_obs=False)
+    _reset_arti_dofs_to_closed(gym)
     gym.save_root = save_root
     
     return gym, cfgs
@@ -977,8 +1021,20 @@ elif args.mode == "run_arti_open":
         cfgs["asset"]["arti_gapartnet_ids"] = [
             gapart_id
         ]
+        support_surface_z = _support_surface_z_for_asset(gapart_id)
+        arti_pose_z = _pose_z_for_support_surface_height(
+            min_z=gapartnet_obj_min_z_,
+            scale=cfgs["asset"]["arti_obj_scale"],
+            support_surface_z=support_surface_z,
+        )
+        placement_mode = "tabletop_support_surface" if support_surface_z > 0 else "floor_support_surface"
+        print(
+            f"[DIAG] {placement_mode}: pose_z={arti_pose_z:.6f} "
+            f"support_surface_z={support_surface_z:.3f} "
+            f"scaled_min_z={cfgs['asset']['arti_obj_scale'] * gapartnet_obj_min_z_:.6f}"
+        )
         cfgs["asset"]["arti_obj_pose_ps"] = [
-            [.8, 0, -0.4*gapartnet_obj_min_z_]
+            [.8, 0, arti_pose_z]
         ]
         # init gym
         gym, cfgs = init_gym(cfgs, task_cfg=task_cfg)
@@ -1014,9 +1070,19 @@ elif args.mode == "run_arti_open":
         
         object_dir = os.path.dirname(path)
         fixed_parent, fixed_rotation, movable_joints_by_child, movable_joint_names = _parse_urdf_joint_info(object_dir)
-        selected_source = "legacy_bbox_id"
-        pre_resolved_joint = None
-        bbox_id = -1
+        if args.part_id is not None:
+            bbox_id, selected_source, pre_resolved_joint = _select_bbox_for_requested_part(
+                args.part_id,
+                gapart_anno,
+                gapart_raw_valid_anno,
+                fixed_parent,
+                fixed_rotation,
+                movable_joints_by_child,
+            )
+        else:
+            selected_source = "legacy_bbox_id"
+            pre_resolved_joint = None
+            bbox_id = -1
         print(f"[DIAG] selected bbox_id={bbox_id} source={selected_source} requested_part_id={args.part_id}")
 
         # get the part bbox and calculate handle approach geometry
@@ -1136,6 +1202,7 @@ elif args.mode == "run_arti_open":
         video_metadata = (video_result or {}).get("video_metadata") or _probe_video_metadata(video_path)
         initial_target_value = None
         final_target_value = None
+        closed_dof_reference = np.asarray(gym.arti_obj_dof_props["lower"], dtype=np.float32)
         if target_dof_index is not None:
             initial_target_value = float(np.asarray(dof_initial).reshape(np.asarray(dof_initial).shape[0], -1)[0, target_dof_index])
             final_target_value = float(np.asarray(final_dof).reshape(np.asarray(final_dof).shape[0], -1)[0, target_dof_index])
@@ -1159,11 +1226,16 @@ elif args.mode == "run_arti_open":
             "joint_type": None if joint_desc is None else ("revolute" if joint_desc.get("type") == "continuous" else joint_desc.get("type")),
             "initial_dof": initial_target_value,
             "final_dof": final_target_value,
+            "initial_dof_all": np.asarray(dof_initial).reshape(np.asarray(dof_initial).shape[0], -1)[0].astype(float).tolist(),
+            "closed_dof_reference": closed_dof_reference.astype(float).tolist(),
             "delta": final_delta,
             "legacy_pre_grasp_offset": 0.2,
             "legacy_grasp_offset": 0.1,
             "legacy_pull_steps": 30,
             "legacy_pull_step": 0.01,
+            "placement_mode": placement_mode,
+            "support_surface_z": support_surface_z,
+            "arti_pose_z": arti_pose_z,
             "settle_steps": 1000,
             "video": video_path,
             "video_writer": (video_result or {}).get("writer"),
@@ -1430,6 +1502,7 @@ elif args.mode == "run_arti_open":
         print(_format_arti_dof_diag(final_stage_label, final_dof, joint_desc=joint_desc, initial=dof_initial, target_dof_index=target_dof_index))
         initial_target_value = None
         final_target_value = None
+        closed_dof_reference = np.asarray(gym.arti_obj_dof_props["lower"], dtype=np.float32)
         if target_dof_index is not None:
             initial_target_value = float(np.asarray(dof_initial).reshape(np.asarray(dof_initial).shape[0], -1)[0, target_dof_index])
             final_target_value = float(np.asarray(final_dof).reshape(np.asarray(final_dof).shape[0], -1)[0, target_dof_index])
@@ -1482,6 +1555,8 @@ elif args.mode == "run_arti_open":
             "joint_type": None if joint_desc is None else ("revolute" if joint_desc.get("type") == "continuous" else joint_desc.get("type")),
             "initial_dof": initial_target_value,
             "final_dof": final_target_value,
+            "initial_dof_all": np.asarray(dof_initial).reshape(np.asarray(dof_initial).shape[0], -1)[0].astype(float).tolist(),
+            "closed_dof_reference": closed_dof_reference.astype(float).tolist(),
             "delta": final_delta,
             "required_delta": final_success_threshold,
             "success_delta_threshold_used": success_threshold_for_exit,

@@ -28,6 +28,9 @@ HELPERS = {
     "_select_bbox_for_requested_part",
     "_select_highest_fixed_handle",
     "_legacy_open_demo_targets",
+    "_pose_z_for_support_surface_height",
+    "_support_surface_z_for_asset",
+    "_closed_arti_dof_state_command",
     "_probe_video_metadata",
     "_frame_sequence_metadata",
     "_legacy_output_baseline_metadata",
@@ -86,6 +89,24 @@ def test_articulated_dof_positions_slice_after_franka_and_rigid_objects():
 
     assert dummy.refreshed
     assert np.allclose(pos, [[11.0, 12.0, 13.0]])
+
+
+def test_closed_arti_dof_state_command_sets_all_articulated_dofs_to_lower_and_zero_velocity():
+    helpers = load_helpers()
+    dof_states = np.zeros((1, 14, 2), dtype=np.float32)
+    dof_states[0, :, 0] = np.arange(14, dtype=np.float32)
+    lower = np.array([0.0, -0.2, 0.1], dtype=np.float32)
+
+    updated = helpers._closed_arti_dof_state_command(
+        dof_states,
+        franka_num_dofs=9,
+        obj_num_dofs=2,
+        arti_lower=lower,
+    )
+
+    assert np.allclose(updated[0, 11:14, 0], lower)
+    assert np.allclose(updated[0, 11:14, 1], 0.0)
+    assert np.allclose(updated[0, :11, 0], np.arange(11, dtype=np.float32))
 
 
 def test_format_articulated_dof_diag_includes_named_joint_delta():
@@ -365,6 +386,27 @@ def test_legacy_open_demo_targets_match_c8d4ad2_offsets():
     assert pull_targets.shape == (30, 3)
     assert np.allclose(pull_targets[0], [0.5, 0.1, 0.3])
     assert np.allclose(pull_targets[-1], [0.21, 0.1, 0.3])
+
+
+def test_pose_z_for_support_surface_height_places_scaled_bottom_on_surface():
+    helpers = load_helpers()
+
+    pose_z = helpers._pose_z_for_support_surface_height(
+        min_z=0.25,
+        scale=0.4,
+        support_surface_z=0.43,
+    )
+
+    assert np.isclose(pose_z, 0.33)
+    assert np.isclose(pose_z + 0.4 * 0.25, 0.43)
+
+
+def test_support_surface_z_for_asset_only_uses_tabletop_for_27044():
+    helpers = load_helpers()
+
+    assert np.isclose(helpers._support_surface_z_for_asset("27044"), 0.43)
+    assert np.isclose(helpers._support_surface_z_for_asset("40147"), 0.0)
+    assert np.isclose(helpers._support_surface_z_for_asset("45661"), 0.0)
 
 
 def test_frame_sequence_metadata_counts_jpg_frames(tmp_path):
