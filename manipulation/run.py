@@ -451,6 +451,65 @@ def _compute_pull_targets(init_position, approach_dir, pull_dir, grasp_offset, p
     )
 
 
+def _compute_revolute_grasp_hold_targets(handle_center, grasp_offset, geom, tangent_step, steps, direction_sign=1.0):
+    """Generate a short tangential pull that starts from the handle grasp pose."""
+    geom = dict(geom or {})
+    approach_dir = _safe_normalize_np(geom.get("approach_dir", np.array([-1.0, 0.0, 0.0], dtype=np.float32)), fallback=np.array([-1.0, 0.0, 0.0], dtype=np.float32))
+    tangent_dir = _safe_normalize_np(geom.get("tangent_dir", np.array([0.0, 1.0, 0.0], dtype=np.float32)), fallback=np.array([0.0, 1.0, 0.0], dtype=np.float32))
+    grasp_position = np.asarray(handle_center, dtype=np.float32) + float(grasp_offset) * approach_dir
+    tangent_dir = _safe_normalize_np(direction_sign * tangent_dir, fallback=np.array([0.0, 1.0, 0.0], dtype=np.float32))
+    return np.stack(
+        [grasp_position + (step_i + 1) * float(tangent_step) * tangent_dir for step_i in range(int(steps))],
+        axis=0,
+    )
+
+
+def _compute_revolute_grasp_hold_arc_targets(handle_center, grasp_offset, geom, hold_steps, angle_step, arc_steps, direction_sign=1.0):
+    """Hold the grasp briefly, add a short breakaway, then move along the revolute arc."""
+    geom = dict(geom or {})
+    hold_steps = max(int(hold_steps), 0)
+    arc_steps = max(int(arc_steps), 0)
+    hold_position = np.asarray(handle_center, dtype=np.float32) + float(grasp_offset) * _safe_normalize_np(
+        geom.get("approach_dir", np.array([-1.0, 0.0, 0.0], dtype=np.float32)),
+        fallback=np.array([-1.0, 0.0, 0.0], dtype=np.float32),
+    )
+    hold_targets = np.stack([hold_position for _ in range(hold_steps)], axis=0) if hold_steps > 0 else np.zeros((0, 3), dtype=np.float32)
+    breakaway_steps = max(int(geom.get("breakaway_steps", hold_steps)), 0)
+    breakaway_step = float(
+        geom.get(
+            "breakaway_step",
+            max(0.008, 0.5 * abs(float(grasp_offset)) if float(grasp_offset) != 0.0 else 0.008),
+        )
+    )
+    breakaway_targets = (
+        _compute_revolute_grasp_hold_targets(
+            handle_center,
+            grasp_offset,
+            geom,
+            tangent_step=breakaway_step,
+            steps=breakaway_steps,
+            direction_sign=direction_sign,
+        )
+        if breakaway_steps > 0
+        else np.zeros((0, 3), dtype=np.float32)
+    )
+    arc_targets = _compute_revolute_arc_targets(
+        handle_center,
+        grasp_offset,
+        geom.get("approach_dir", np.array([-1.0, 0.0, 0.0], dtype=np.float32)),
+        geom,
+        angle_step,
+        arc_steps,
+        direction_sign=direction_sign,
+    )
+    pieces = [piece for piece in (hold_targets, breakaway_targets, arc_targets) if piece.size > 0]
+    if not pieces:
+        return np.zeros((0, 3), dtype=np.float32)
+    if len(pieces) == 1:
+        return pieces[0]
+    return np.concatenate(pieces, axis=0)
+
+
 def _legacy_open_demo_targets(init_position, handle_out):
     """Return the c8d4ad2 run_arti_open single-path targets."""
     init_position = np.asarray(init_position, dtype=np.float32)
@@ -1227,6 +1286,29 @@ elif args.mode == "run_arti_open":
         # init gym
         gym, cfgs = init_gym(cfgs, task_cfg=task_cfg)
 
+        dof_before_closed_reset = _get_arti_dof_positions(gym)
+        closed_reference = _reset_arti_dofs_to_closed(gym)
+        dof_after_closed_reset = _get_arti_dof_positions(gym)
+        if closed_reference is None:
+            closed_init_check = {
+                "applied": False,
+                "reason": "no_articulated_dofs",
+                "before": dof_before_closed_reset.tolist(),
+                "after": dof_after_closed_reset.tolist(),
+                "closed_reference": None,
+                "max_abs_error_after": None,
+            }
+        else:
+            closed_error = np.abs(dof_after_closed_reset - np.asarray(closed_reference, dtype=np.float32).reshape(1, -1))
+            closed_init_check = {
+                "applied": True,
+                "before": dof_before_closed_reset.tolist(),
+                "after": dof_after_closed_reset.tolist(),
+                "closed_reference": np.asarray(closed_reference, dtype=np.float32).tolist(),
+                "max_abs_error_after": float(np.max(closed_error)) if closed_error.size else 0.0,
+            }
+        print(f"[DIAG] closed init check: {json.dumps(_json_safe(closed_init_check), sort_keys=True)}")
+
         # get the gapartnet annotation
         gym.get_gapartnet_anno()
         
@@ -1310,6 +1392,7 @@ elif args.mode == "run_arti_open":
                 selected_category=selected_category,
                 resolved_joint=resolved_joint,
             )
+            result["closed_init_check"] = _json_safe(closed_init_check)
             _write_attempt_result(gym.save_root, result)
             print(f"[DIAG] requested_joint_type={requested_joint_type} mismatches resolved_joint_type={resolved_joint_type}; stop operation")
             gym.clean_up()
@@ -1434,6 +1517,17 @@ elif args.mode == "run_arti_open":
         initial_target_value = None
         final_target_value = None
         closed_dof_reference = np.asarray(gym.arti_obj_dof_props["lower"], dtype=np.float32)
+        dof_before_closed_reset = _get_arti_dof_positions(gym)
+        closed_reference = _reset_arti_dofs_to_closed(gym)
+        dof_after_closed_reset = _get_arti_dof_positions(gym)
+        closed_init_check = {
+            "before": np.asarray(dof_before_closed_reset).astype(float).tolist(),
+            "after": np.asarray(dof_after_closed_reset).astype(float).tolist(),
+            "closed_reference": np.asarray(closed_reference).astype(float).tolist(),
+            "applied": bool(np.allclose(np.asarray(dof_after_closed_reset), np.asarray(closed_reference), atol=1e-6)),
+            "max_abs_error_after": float(np.max(np.abs(np.asarray(dof_after_closed_reset) - np.asarray(closed_reference)))),
+        }
+        print(f"[DIAG] closed init check: {json.dumps(closed_init_check, sort_keys=True)}")
         if target_dof_index is not None:
             initial_target_value = float(np.asarray(dof_initial).reshape(np.asarray(dof_initial).shape[0], -1)[0, target_dof_index])
             final_target_value = float(np.asarray(final_dof).reshape(np.asarray(final_dof).shape[0], -1)[0, target_dof_index])
@@ -1462,6 +1556,7 @@ elif args.mode == "run_arti_open":
             "final_dof": final_target_value,
             "initial_dof_all": np.asarray(dof_initial).reshape(np.asarray(dof_initial).shape[0], -1)[0].astype(float).tolist(),
             "closed_dof_reference": closed_dof_reference.astype(float).tolist(),
+            "closed_init_check": _json_safe(closed_init_check),
             "delta": final_delta,
             "legacy_pre_grasp_offset": 0.2,
             "legacy_grasp_offset": 0.1,
@@ -1541,10 +1636,12 @@ elif args.mode == "run_arti_open":
         best_delta = -1.0
         best_label = None
         selected_revolute_axis_point = None
+        selected_revolute_axis_point_from_joint = None
         selected_attempt_success = False
         selected_attempt_label = None
         selected_attempt_dof = None
         selected_attempt_stopped_during_pull = False
+        pull_step_gripper_metrics = []
         for candidate_i, candidate in enumerate(candidates):
             cand_label = candidate["label"]
             cand_grasp_offset = float(candidate["grasp_offset"])
@@ -1601,7 +1698,17 @@ elif args.mode == "run_arti_open":
 
             # open/pull the articulated part using joint-aware pull direction
             if is_revolute_target:
-                revolute_axis_point = _estimate_revolute_axis_point_from_bbox(
+                if selected_revolute_axis_point_from_joint is None and resolved_joint is not None:
+                    joint_frame_asset = _joint_frame_in_asset(object_dir, resolved_joint.get("name"))
+                    joint_frame_world = _asset_frame_to_world(
+                        joint_frame_asset,
+                        gym.arti_init_obj_pos_list[0],
+                        gym.arti_init_obj_rot_list[0],
+                        cfgs["asset"]["arti_obj_scale"],
+                    )
+                    selected_revolute_axis_point_from_joint = joint_frame_world[:3, 3].astype(np.float32)
+                    print(f"[DIAG] revolute joint origin used as axis point: {selected_revolute_axis_point_from_joint}")
+                revolute_axis_point = selected_revolute_axis_point_from_joint if selected_revolute_axis_point_from_joint is not None else _estimate_revolute_axis_point_from_bbox(
                     init_position + cand_bias,
                     movable_bbox_np,
                     resolved_joint.get("axis_root", approach_dir),
@@ -1620,13 +1727,16 @@ elif args.mode == "run_arti_open":
                     f"radial={revolute_geom['radial_dir']} tangent={revolute_geom['tangent_dir']} "
                     f"radius={revolute_geom['radius']:.4f}"
                 )
-                pull_targets = _compute_revolute_arc_targets(
+                hold_steps = 6
+                hold_target = np.asarray(init_position + cand_bias + cand_grasp_offset * approach_dir, dtype=np.float32)
+                hold_targets = np.stack([hold_target for _ in range(hold_steps)], axis=0)
+                pull_targets = _compute_revolute_grasp_hold_arc_targets(
                     init_position + cand_bias,
                     cand_grasp_offset,
-                    approach_dir,
-                    revolute_geom,
-                    revolute_angle_step,
-                    revolute_steps,
+                    {**revolute_geom, "approach_dir": approach_dir},
+                    hold_steps=hold_steps,
+                    angle_step=0.025,
+                    arc_steps=max(revolute_steps - 4, 1),
                     direction_sign=cand_arc_sign,
                 )
             else:
@@ -1636,8 +1746,9 @@ elif args.mode == "run_arti_open":
             early_delta = 0.0
             attempt_reached_success_during_pull = False
             for i, pull_target in enumerate(pull_targets): 
+                pull_pose_rot = rotations[bbox_id].cpu().numpy()
                 step_num, traj = gym.control_to_pose(
-                    np.array([*pull_target,*(rotations[bbox_id].cpu().numpy())]),
+                    np.array([*pull_target,*pull_pose_rot]),
                     close_gripper = True, save_video = args.save_video, save_root = gym.save_root, step_num = step_num, use_ik = True)
                 dof_now = None
                 if i in {0, early_pull_check_step - 1, len(pull_targets) - 1}:
@@ -1658,20 +1769,28 @@ elif args.mode == "run_arti_open":
                     if dof_now is None:
                         dof_now = _get_arti_dof_positions(gym)
                     step_delta = _target_abs_delta(dof_now, dof_initial, target_dof_index)
+                    initial_value_for_step = float(np.asarray(dof_initial).reshape(np.asarray(dof_initial).shape[0], -1)[0, target_dof_index])
+                    step_target_value = float(np.asarray(dof_now).reshape(np.asarray(dof_now).shape[0], -1)[0, target_dof_index])
+                    step_handle_bbox = _transform_handle_bbox_for_final_joint(
+                        all_bbox_now[bbox_id].cpu().numpy(),
+                        resolved_joint,
+                        initial_value_for_step,
+                        step_target_value,
+                        prismatic_dir=pull_dir,
+                        revolute_axis_point=selected_revolute_axis_point,
+                    )
+                    step_gripper_metrics = _gripper_handle_metrics(gym, step_handle_bbox)
+                    pull_step_gripper_metrics.append({
+                        "candidate": cand_label,
+                        "step": i + 1,
+                        "delta": float(step_delta),
+                        "on_handle": bool(step_gripper_metrics["on_handle"]),
+                        "metrics": _json_safe(step_gripper_metrics),
+                    })
+                    print(f"[DIAG] pull_step_metrics[{cand_label}][{i+1}]: on_handle={step_gripper_metrics['on_handle']} delta={step_delta:.6f}")
                     if np.isfinite(step_delta) and step_delta >= success_threshold_for_exit:
-                        initial_value_for_step = float(np.asarray(dof_initial).reshape(np.asarray(dof_initial).shape[0], -1)[0, target_dof_index])
-                        step_target_value = float(np.asarray(dof_now).reshape(np.asarray(dof_now).shape[0], -1)[0, target_dof_index])
-                        step_handle_bbox = _transform_handle_bbox_for_final_joint(
-                            all_bbox_now[bbox_id].cpu().numpy(),
-                            resolved_joint,
-                            initial_value_for_step,
-                            step_target_value,
-                            prismatic_dir=pull_dir,
-                            revolute_axis_point=selected_revolute_axis_point,
-                        )
-                        step_gripper_on_handle = _is_gripper_on_handle(gym, step_handle_bbox)
-                        print(f"[DIAG] success_check_step_{i+1}[{cand_label}]: delta={step_delta:.6f} gripper_on_handle={step_gripper_on_handle}")
-                        if step_gripper_on_handle:
+                        print(f"[DIAG] success_check_step_{i+1}[{cand_label}]: delta={step_delta:.6f} gripper_on_handle={step_gripper_metrics['on_handle']}")
+                        if step_gripper_metrics["on_handle"]:
                             attempt_reached_success_during_pull = True
                             print(f"[DIAG] success threshold reached during pull at step {i+1}; stopping pull with gripper closed")
                             break
@@ -1739,6 +1858,14 @@ elif args.mode == "run_arti_open":
         initial_target_value = None
         final_target_value = None
         closed_dof_reference = np.asarray(gym.arti_obj_dof_props["lower"], dtype=np.float32)
+        closed_reference = np.asarray(gym.arti_obj_dof_props["lower"], dtype=np.float32)
+        closed_init_check = {
+            "before": np.asarray(dof_initial).astype(float).tolist(),
+            "after": np.asarray(dof_initial).astype(float).tolist(),
+            "closed_reference": closed_reference.astype(float).tolist(),
+            "applied": bool(np.allclose(np.asarray(dof_initial), closed_reference, atol=1e-6)),
+            "max_abs_error_after": float(np.max(np.abs(np.asarray(dof_initial) - closed_reference))),
+        }
         if target_dof_index is not None:
             initial_target_value = float(np.asarray(dof_initial).reshape(np.asarray(dof_initial).shape[0], -1)[0, target_dof_index])
             final_target_value = float(np.asarray(final_dof).reshape(np.asarray(final_dof).shape[0], -1)[0, target_dof_index])
@@ -1814,6 +1941,10 @@ elif args.mode == "run_arti_open":
             "settle_steps": settle_steps,
             "assisted_revolute_applied": assisted_revolute_applied,
             "target_dof_index": target_dof_index,
+            "pull_step_gripper_metrics": _json_safe(pull_step_gripper_metrics),
+            "ever_on_handle_during_pull": bool(any(item.get("on_handle") for item in pull_step_gripper_metrics)),
+            "first_on_handle_step": next((item for item in pull_step_gripper_metrics if item.get("on_handle")), None),
+            "closest_handle_step": min(pull_step_gripper_metrics, key=lambda item: item.get("metrics", {}).get("finger_midpoint_distance", float("inf"))) if pull_step_gripper_metrics else None,
         }
         _write_attempt_result(gym.save_root, result)
         

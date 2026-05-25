@@ -15,6 +15,7 @@ HELPERS = {
     "_project_point_to_axis",
     "_compute_revolute_motion_geometry",
     "_compute_revolute_arc_targets",
+    "_compute_revolute_grasp_hold_targets",
     "_estimate_revolute_axis_point_from_bbox",
     "_orthonormal_frame_from_z",
     "_rotation_from_link_to_root",
