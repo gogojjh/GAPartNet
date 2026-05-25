@@ -16,6 +16,7 @@ HELPERS = {
     "_compute_revolute_motion_geometry",
     "_compute_revolute_arc_targets",
     "_estimate_revolute_axis_point_from_bbox",
+    "_orthonormal_frame_from_z",
     "_rotation_from_link_to_root",
     "_resolve_controlling_joint",
     "_required_success_delta",
@@ -33,8 +34,12 @@ HELPERS = {
     "_closed_arti_dof_state_command",
     "_probe_video_metadata",
     "_frame_sequence_metadata",
+    "_write_video_mp4_from_frame_list",
     "_legacy_output_baseline_metadata",
     "_json_safe",
+    "_normalize_requested_joint_type",
+    "_normalize_resolved_joint_type",
+    "_joint_type_mismatch_result",
 }
 
 
@@ -443,6 +448,22 @@ def test_frame_sequence_metadata_defaults_to_png_frames(tmp_path):
     assert metadata["height"] == 4
 
 
+def test_write_video_from_frame_list_does_not_create_png_sidecars_by_default(tmp_path):
+    helpers = load_helpers()
+    frames = [
+        np.zeros((8, 10, 3), dtype=np.uint8),
+        np.full((8, 10, 3), 255, dtype=np.uint8),
+    ]
+
+    result = helpers._write_video_mp4_from_frame_list(str(tmp_path), frames, output_name="manipulation.mp4", fps=5)
+
+    assert result["path"].endswith("manipulation.mp4")
+    assert result["writer"] == "opencv_mp4v"
+    assert result["frame_metadata"]["count"] == 2
+    assert pathlib.Path(result["path"]).exists()
+    assert not (tmp_path / "video").exists()
+
+
 def test_legacy_output_without_result_is_visual_baseline_not_joint_identity(tmp_path):
     helpers = load_helpers()
     output = tmp_path / "45661"
@@ -468,3 +489,61 @@ def test_json_safe_converts_numpy_values():
     converted = helpers._json_safe(value)
 
     assert converted == {"axis": [1.0, 2.0], "index": 3, "items": [0.5]}
+
+def test_normalize_joint_type_accepts_prismatic_revolute_and_continuous_alias():
+    helpers = load_helpers()
+
+    assert helpers._normalize_requested_joint_type(None) is None
+    assert helpers._normalize_requested_joint_type("prismatic") == "prismatic"
+    assert helpers._normalize_requested_joint_type("revolute") == "revolute"
+    assert helpers._normalize_resolved_joint_type("continuous") == "revolute"
+
+
+def test_normalize_requested_joint_type_rejects_unknown_type():
+    helpers = load_helpers()
+
+    try:
+        helpers._normalize_requested_joint_type("fixed")
+    except ValueError as exc:
+        assert "Unsupported --joint_type" in str(exc)
+    else:
+        raise AssertionError("expected invalid requested joint type to raise")
+
+
+def test_joint_type_mismatch_result_stops_before_operation():
+    helpers = load_helpers()
+
+    result = helpers._joint_type_mismatch_result(
+        gapart_id="12345",
+        object_path="/tmp/12345",
+        task_root="output",
+        save_root="output/12345",
+        requested_joint_type="revolute",
+        resolved_joint_type="prismatic",
+        tested_part_id=2,
+        selected_bbox_id=4,
+        selected_source="raw_part_id_mapped_to_handle",
+        selected_link="link_5",
+        selected_category="line_fixed_handle",
+        resolved_joint={"name": "joint_1", "type": "prismatic"},
+    )
+
+    assert result["status"] == "failure"
+    assert result["failure_reason"] == "requested_joint_type_mismatch"
+    assert result["requested_joint_type"] == "revolute"
+    assert result["resolved_joint_type"] == "prismatic"
+    assert result["tested_part_id"] == 2
+    assert result["selected_joint"] == {"name": "joint_1", "type": "prismatic"}
+
+
+def test_orthonormal_frame_from_z_uses_requested_z_axis():
+    helpers = load_helpers()
+
+    frame = helpers._orthonormal_frame_from_z(
+        np.array([0.0, 0.0, 2.0], dtype=np.float32),
+        x_hint=np.array([1.0, 1.0, 0.0], dtype=np.float32),
+    )
+
+    assert frame.shape == (3, 3)
+    assert np.allclose(frame[:, 2], [0.0, 0.0, 1.0])
+    assert np.allclose(frame.T @ frame, np.eye(3), atol=1e-6)

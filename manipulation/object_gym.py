@@ -66,6 +66,8 @@ class ObjectGym():
         self.debug = cfgs["debug"]
         self.use_cam = cfgs["cam"]["use_cam"]
         self.steps = cfgs["steps"]
+        self.video_frames = []
+        self.save_video_frames = bool(cfgs.get("SAVE_VIDEO_FRAMES", False))
         
         # configure env grid
         self.num_envs = cfgs["num_envs"]
@@ -747,8 +749,7 @@ class ObjectGym():
             if save_video:
                 self.gym.render_all_camera_sensors(self.sim)
                 step_str = str(start_step + step_i).zfill(4)
-                os.makedirs(f"{save_root}/video", exist_ok=True)
-                self.save_camera_frame(f"{save_root}/video/step-{step_str}.png")
+                self.record_camera_frame(save_root, start_step + step_i)
 
     def init_observation(self):
         # get jacobian tensor
@@ -1057,8 +1058,7 @@ class ObjectGym():
                 self.gym.render_all_camera_sensors(self.sim)
                 # print("Saving video frame:", start_step + step_i)
                 step_str = str(start_step + step_i).zfill(4)
-                os.makedirs(f"{save_root}/video", exist_ok=True)
-                self.save_camera_frame(f"{save_root}/video/step-{step_str}.png")
+                self.record_camera_frame(save_root, start_step + step_i)
                 # self.gym.write_viewer_image_to_file(self.viewer, f"{save_root}/step-{start_step + step_i}.png")
           
     def move_gripper(self, close_gripper = True, save_video = False, save_root = "", start_step = 0):
@@ -1080,13 +1080,119 @@ class ObjectGym():
             # print("Saving video frame:", start_step)
             # start_step string, 4 digit
             step_str = str(start_step).zfill(4)
-            os.makedirs(f"{save_root}/video", exist_ok=True)
-            self.save_camera_frame(f"{save_root}/video/step-{step_str}.png")
+            self.record_camera_frame(save_root, start_step)
         return start_step + 1
+
+    def set_video_axis_overlays(self, overlays):
+        self.video_axis_overlays = overlays or []
+
+    def _project_world_point_to_camera_pixel(self, point, env_i=0, cam_i=0):
+        point = np.asarray(point, dtype=np.float32)
+        cam_pos = np.asarray(self.cam_poss[cam_i], dtype=np.float32)
+        cam_target = np.asarray(self.cam_targets[cam_i], dtype=np.float32)
+        if hasattr(self, "env_offsets") and len(self.env_offsets) > env_i:
+            env_offset = np.asarray(self.env_offsets[env_i], dtype=np.float32)
+            point = point - env_offset
+        forward = cam_target - cam_pos
+        forward_norm = np.linalg.norm(forward)
+        if forward_norm < 1e-6:
+            return None
+        forward = forward / forward_norm
+        world_up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        right = np.cross(forward, world_up)
+        if np.linalg.norm(right) < 1e-6:
+            right = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        right = right / np.linalg.norm(right)
+        up = np.cross(right, forward)
+        rel = point - cam_pos
+        depth = float(np.dot(rel, forward))
+        if depth <= 1e-4:
+            return None
+        x_cam = float(np.dot(rel, right))
+        y_cam = float(np.dot(rel, up))
+        focal = 0.5 * float(self.cam_w) / math.tan(math.radians(float(self.horizontal_fov)) * 0.5)
+        x = int(0.5 * self.cam_w + focal * x_cam / depth)
+        y = int(0.5 * self.cam_h - focal * y_cam / depth)
+        if x < -self.cam_w or x > 2 * self.cam_w or y < -self.cam_h or y > 2 * self.cam_h:
+            return None
+        return x, y
+
+    def _draw_video_axis_overlays(self, frame):
+        if not self.video_axis_overlays:
+            return frame
+        colors = {
+            "x": (0, 0, 255),
+            "y": (0, 255, 0),
+            "z": (255, 0, 0),
+        }
+        labels = {"x": "X", "y": "Y", "z": "Z"}
+        for overlay in self.video_axis_overlays:
+            origin = np.asarray(overlay.get("origin", [0.0, 0.0, 0.0]), dtype=np.float32)
+            axes = np.asarray(overlay.get("axes", np.eye(3, dtype=np.float32)), dtype=np.float32).reshape(3, 3)
+            length = float(overlay.get("length", 0.12))
+            prefix = str(overlay.get("label", ""))
+            screen_origin = overlay.get("screen_origin")
+            if screen_origin is not None:
+                base = (int(screen_origin[0]), int(screen_origin[1]))
+                cv2.putText(frame, "world frame" if prefix == "W" else "joint frame", (base[0] - 10, base[1] - 28), cv2.FONT_HERSHEY_SIMPLEX, 1.125, (0, 0, 0), 8, cv2.LINE_AA)
+                cv2.putText(frame, "world frame" if prefix == "W" else "joint frame", (base[0] - 10, base[1] - 28), cv2.FONT_HERSHEY_SIMPLEX, 1.125, (255, 255, 255), 3, cv2.LINE_AA)
+                screen_dirs = {"x": (95, 0), "y": (0, 95), "z": (-65, -65)}
+                for axis_name, delta in screen_dirs.items():
+                    end = (base[0] + delta[0], base[1] + delta[1])
+                    cv2.line(frame, base, end, (0, 0, 0), 14, cv2.LINE_AA)
+                    cv2.line(frame, base, end, colors[axis_name], 9, cv2.LINE_AA)
+                    cv2.circle(frame, end, 10, (0, 0, 0), -1, cv2.LINE_AA)
+                    cv2.circle(frame, end, 8, colors[axis_name], -1, cv2.LINE_AA)
+                    text = f"{prefix}{labels[axis_name]}"
+                    cv2.putText(frame, text, (end[0] + 8, end[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.975, (0, 0, 0), 6, cv2.LINE_AA)
+                    cv2.putText(frame, text, (end[0] + 8, end[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.975, colors[axis_name], 3, cv2.LINE_AA)
+            if screen_origin is not None:
+                continue
+            start = self._project_world_point_to_camera_pixel(origin)
+            if start is None:
+                continue
+            if prefix:
+                cv2.putText(frame, prefix, (start[0] + 8, start[1] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 4, cv2.LINE_AA)
+                cv2.putText(frame, prefix, (start[0] + 8, start[1] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+            for axis_i, axis_name in enumerate(("x", "y", "z")):
+                direction = axes[:, axis_i]
+                norm = np.linalg.norm(direction)
+                if norm < 1e-6:
+                    continue
+                end_point = origin + length * direction / norm
+                end = self._project_world_point_to_camera_pixel(end_point)
+                if end is None:
+                    continue
+                cv2.arrowedLine(frame, start, end, (0, 0, 0), 11, cv2.LINE_AA, tipLength=0.22)
+                cv2.arrowedLine(frame, start, end, colors[axis_name], 5, cv2.LINE_AA, tipLength=0.22)
+                text = labels[axis_name]
+                cv2.putText(frame, text, (end[0] + 8, end[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 1.50, (0, 0, 0), 10, cv2.LINE_AA)
+                cv2.putText(frame, text, (end[0] + 8, end[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 1.50, colors[axis_name], 3, cv2.LINE_AA)
+        return frame
+
+    def record_camera_frame(self, save_root, step):
+        if save_root is None:
+            return
+        color = self.gym.get_camera_image(self.sim, self.envs[0], self.cams[0][0], gymapi.IMAGE_COLOR)
+        frame = np.asarray(color, dtype=np.uint8)
+        if frame.ndim == 1:
+            frame = frame.reshape(self.cam_h, self.cam_w, -1)
+        elif frame.ndim == 2 and frame.shape[1] != self.cam_w:
+            frame = frame.reshape(self.cam_h, self.cam_w, -1)
+        elif frame.ndim == 2:
+            frame = np.repeat(frame[:, :, None], 3, axis=2)
+        frame = frame[:, :, :3]
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        frame = self._draw_video_axis_overlays(frame)
+        self.video_frames.append(np.ascontiguousarray(frame.copy()))
+        if self.save_video_frames:
+            step_str = str(step).zfill(4)
+            os.makedirs(f"{save_root}/video", exist_ok=True)
+            cv2.imwrite(f"{save_root}/video/step-{step_str}.png", frame)
 
     def save_camera_frame(self, path):
         self.gym.write_camera_image_to_file(self.sim, self.envs[0], self.cams[0][0], gymapi.IMAGE_COLOR, path)
-        
+
     def control_to_pose(self, pose, close_gripper = True, save_video = False, save_root = "", step_num = 0, use_ik = False, start_qpos = None):
         # move to pre-grasp
         self.refresh_observation(get_visual_obs=False)

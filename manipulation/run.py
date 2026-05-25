@@ -51,11 +51,17 @@ from pytorch3d.transforms import matrix_to_quaternion, quaternion_invert
 sys.path.append(sys.path[-1]+"/gym")
 torch.set_printoptions(precision=4, sci_mode=False)
 
-# Pre-parse --save_video and --object_id before gymutil sees sys.argv (gymutil
+# Pre-parse --save_video, --save_video_frames and --object_id before gymutil sees sys.argv (gymutil
 # spawns worker processes that call parse_arguments without custom_parameters).
 _save_video = "--save_video" in sys.argv
 if _save_video:
     sys.argv.remove("--save_video")
+
+_save_video_frames = "--save_video_frames" in sys.argv or "--save_frames" in sys.argv
+if "--save_video_frames" in sys.argv:
+    sys.argv.remove("--save_video_frames")
+if "--save_frames" in sys.argv:
+    sys.argv.remove("--save_frames")
 
 _object_id = None
 if "--object_id" in sys.argv:
@@ -68,6 +74,13 @@ _object_path = None
 if "--object_path" in sys.argv:
     idx = sys.argv.index("--object_path")
     _object_path = sys.argv[idx + 1]
+    sys.argv.pop(idx)
+    sys.argv.pop(idx)
+
+_joint_type = None
+if "--joint_type" in sys.argv:
+    idx = sys.argv.index("--joint_type")
+    _joint_type = sys.argv[idx + 1]
     sys.argv.pop(idx)
     sys.argv.pop(idx)
 
@@ -89,9 +102,11 @@ args = gymutil.parse_arguments(description="Placement",
         {"name": "--headless", "action": 'store_true', "default": False},
         ])
 args.save_video = _save_video
+args.save_video_frames = _save_video_frames
 args.object_id = _object_id
 args.object_path = _object_path
 args.part_id = _part_id
+args.joint_type = _joint_type
 
 
 
@@ -100,6 +115,60 @@ def _parse_xyz(value, default=(0.0, 0.0, 0.0)):
         return np.array(default, dtype=np.float32)
     parts = [float(x) for x in value.split()]
     return np.array(parts, dtype=np.float32)
+
+
+def _transform_from_xyz_rpy(xyz, rpy):
+    transform = np.eye(4, dtype=np.float32)
+    transform[:3, :3] = R.from_euler("xyz", np.asarray(rpy, dtype=np.float32)).as_matrix().astype(np.float32)
+    transform[:3, 3] = np.asarray(xyz, dtype=np.float32)
+    return transform
+
+
+def _joint_frame_in_asset(object_dir, joint_name):
+    urdf_path = os.path.join(object_dir, "mobility_annotation_gapartnet.urdf")
+    root = ET.parse(urdf_path).getroot()
+    joints_by_name = {}
+    fixed_joint_by_child = {}
+    for joint in root.findall("joint"):
+        name = joint.attrib.get("name")
+        parent_el = joint.find("parent")
+        child_el = joint.find("child")
+        if parent_el is None or child_el is None:
+            continue
+        origin_el = joint.find("origin")
+        xyz = _parse_xyz(origin_el.attrib.get("xyz") if origin_el is not None else None)
+        rpy = _parse_xyz(origin_el.attrib.get("rpy") if origin_el is not None else None)
+        record = {
+            "name": name,
+            "type": joint.attrib.get("type"),
+            "parent": parent_el.attrib.get("link"),
+            "child": child_el.attrib.get("link"),
+            "xyz": xyz,
+            "rpy": rpy,
+        }
+        joints_by_name[name] = record
+        if record["type"] == "fixed":
+            fixed_joint_by_child[record["child"]] = record
+
+    def link_frame(link_name):
+        if link_name is None or link_name == "base" or link_name not in fixed_joint_by_child:
+            return np.eye(4, dtype=np.float32)
+        fixed_joint = fixed_joint_by_child[link_name]
+        return link_frame(fixed_joint["parent"]) @ _transform_from_xyz_rpy(fixed_joint["xyz"], fixed_joint["rpy"])
+
+    joint = joints_by_name.get(joint_name)
+    if joint is None:
+        return np.eye(4, dtype=np.float32)
+    return link_frame(joint["parent"]) @ _transform_from_xyz_rpy(joint["xyz"], joint["rpy"])
+
+
+def _asset_frame_to_world(frame_asset, asset_position, asset_quat_xyzw, asset_scale):
+    frame_asset = np.asarray(frame_asset, dtype=np.float32).copy()
+    world = np.eye(4, dtype=np.float32)
+    obj_rot = R.from_quat(np.asarray(asset_quat_xyzw, dtype=np.float32)).as_matrix().astype(np.float32)
+    world[:3, :3] = obj_rot @ frame_asset[:3, :3]
+    world[:3, 3] = np.asarray(asset_position, dtype=np.float32) + obj_rot @ (float(asset_scale) * frame_asset[:3, 3])
+    return world
 
 
 def _safe_normalize_np(vec, fallback=None):
@@ -181,6 +250,21 @@ def _compute_revolute_motion_geometry(handle_center, movable_center, axis_dir, a
         "tangent_dir": tangent_dir.astype(np.float32),
         "radius": radius,
     }
+
+
+def _orthonormal_frame_from_z(z_axis, x_hint=None):
+    z_axis = _safe_normalize_np(z_axis, fallback=np.array([0.0, 0.0, 1.0], dtype=np.float32))
+    if x_hint is None:
+        x_hint = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    x_axis = np.asarray(x_hint, dtype=np.float32)
+    x_axis = x_axis - np.dot(x_axis, z_axis) * z_axis
+    if np.linalg.norm(x_axis) < 1e-6:
+        x_axis = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        x_axis = x_axis - np.dot(x_axis, z_axis) * z_axis
+    x_axis = _safe_normalize_np(x_axis, fallback=np.array([1.0, 0.0, 0.0], dtype=np.float32))
+    y_axis = _safe_normalize_np(np.cross(z_axis, x_axis), fallback=np.array([0.0, 1.0, 0.0], dtype=np.float32))
+    x_axis = _safe_normalize_np(np.cross(y_axis, z_axis), fallback=x_axis)
+    return np.stack([x_axis, y_axis, z_axis], axis=1).astype(np.float32)
 
 
 def _compute_revolute_arc_targets(handle_center, grasp_offset, approach_dir, geom, angle_step, steps, direction_sign=1.0):
@@ -537,8 +621,7 @@ def _apply_assisted_revolute_motion(gym, dof_initial, target_dof_index, lower, u
         if save_video:
             gym.gym.render_all_camera_sensors(gym.sim)
             step_str = str(step_num + i).zfill(4)
-            os.makedirs(f"{save_root}/video", exist_ok=True)
-            gym.save_camera_frame(f"{save_root}/video/step-{step_str}.png")
+            gym.record_camera_frame(save_root, step_num + i)
     return step_num + steps, goal
 
 
@@ -717,6 +800,53 @@ def _write_video_mp4_from_frames(save_root, output_name="manipulation.mp4", fps=
     return result
 
 
+def _write_video_mp4_from_frame_list(save_root, frames, output_name="manipulation.mp4", fps=30):
+    """Encode in-memory BGR/RGB frames to mp4 without requiring PNG sidecars."""
+    output_path = os.path.join(save_root, output_name)
+    frame_count = len(frames) if frames is not None else 0
+    result = {
+        "path": output_path,
+        "writer": None,
+        "fps": fps,
+        "frame_metadata": {"count": frame_count, "source": "memory"},
+        "video_metadata": None,
+        "warnings": [],
+    }
+    if frame_count == 0:
+        result["warnings"].append("no_frames_provided")
+        return result
+    first = np.asarray(frames[0])
+    if first.ndim != 3 or first.shape[2] < 3:
+        result["warnings"].append(f"invalid_first_frame_shape: {first.shape}")
+        return result
+    height, width = first.shape[:2]
+    result["frame_metadata"].update({"height": int(height), "width": int(width)})
+    os.makedirs(save_root, exist_ok=True)
+    writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), float(fps), (width, height))
+    if not writer.isOpened():
+        result["warnings"].append(f"opencv_videowriter_failed: {output_path}")
+        return result
+    written = 0
+    for frame in frames:
+        frame = np.asarray(frame)
+        if frame.ndim != 3 or frame.shape[2] < 3:
+            result["warnings"].append(f"skipped_invalid_frame_shape: {frame.shape}")
+            continue
+        frame = frame[:, :, :3]
+        if frame.shape[:2] != (height, width):
+            frame = cv2.resize(frame, (width, height))
+        if frame.dtype != np.uint8:
+            frame = np.clip(frame, 0, 255).astype(np.uint8)
+        writer.write(frame)
+        written += 1
+    writer.release()
+    result["writer"] = "opencv_mp4v"
+    result["frame_metadata"]["count"] = written
+    result["video_metadata"] = _probe_video_metadata(output_path)
+    print(f"[DIAG] wrote complete mp4 from memory: {output_path}")
+    return result
+
+
 def _required_success_delta(joint_desc, lower=None, upper=None):
     """Return the requested per-joint success threshold."""
     if joint_desc is None:
@@ -820,8 +950,10 @@ def _write_attempt_result(save_root, result):
     return result_path
 
 
-def _discard_video_frames_from(save_root, start_step):
+def _discard_video_frames_from(save_root, start_step, frame_buffer=None):
     video_dir = os.path.join(save_root, "video")
+    if frame_buffer is not None:
+        del frame_buffer[int(start_step):]
     if not os.path.isdir(video_dir):
         return 0
     removed = 0
@@ -862,6 +994,61 @@ def _control_to_pose_repeated_ik(
         if record:
             step_num = next_step
     return step_num, None
+
+
+def _normalize_requested_joint_type(joint_type):
+    if joint_type is None or joint_type == "":
+        return None
+    normalized = str(joint_type).strip().lower()
+    if normalized == "primismatic":
+        normalized = "prismatic"
+    if normalized not in {"prismatic", "revolute"}:
+        raise ValueError(f"Unsupported --joint_type {joint_type!r}; expected prismatic or revolute")
+    return normalized
+
+
+def _normalize_resolved_joint_type(joint_type):
+    if joint_type is None:
+        return None
+    normalized = str(joint_type).strip().lower()
+    if normalized == "continuous":
+        return "revolute"
+    if normalized == "primismatic":
+        return "prismatic"
+    return normalized
+
+
+def _joint_type_mismatch_result(
+    gapart_id,
+    object_path,
+    task_root,
+    save_root,
+    requested_joint_type,
+    resolved_joint_type,
+    tested_part_id,
+    selected_bbox_id,
+    selected_source,
+    selected_link,
+    selected_category,
+    resolved_joint,
+):
+    return {
+        "asset_id": gapart_id,
+        "object_path": object_path,
+        "task_root": task_root,
+        "save_root": save_root,
+        "mode": "run_arti_open",
+        "status": "failure",
+        "failure_reason": "requested_joint_type_mismatch",
+        "requested_joint_type": requested_joint_type,
+        "resolved_joint_type": resolved_joint_type,
+        "tested_part_id": int(tested_part_id) if tested_part_id is not None else None,
+        "selected_bbox_id": int(selected_bbox_id),
+        "selected_source": selected_source,
+        "selected_link": selected_link,
+        "selected_category": selected_category,
+        "selected_joint": _json_safe(resolved_joint),
+    }
 
 
 def _json_safe(value):
@@ -1010,6 +1197,7 @@ elif args.mode == "run_arti_open":
         os.makedirs(task_cfg["save_root"], exist_ok=True)
         cfgs["HEADLESS"] = args.headless
         cfgs["SAVE_VIDEO"] = args.save_video
+        cfgs["SAVE_VIDEO_FRAMES"] = args.save_video_frames
         cfgs["USE_CUROBO"] = False
         cfgs["asset"]["arti_asset_root"] = asset_root
         cfgs["asset"]["arti_obj_root"] = ROOT
@@ -1105,6 +1293,28 @@ elif args.mode == "run_arti_open":
         selected_link = selected_anno.get("link_name", "")
         selected_category = selected_anno.get("category", "")
         resolved_joint = pre_resolved_joint or _resolve_controlling_joint(selected_link, fixed_parent, fixed_rotation, movable_joints_by_child)
+        requested_joint_type = _normalize_requested_joint_type(args.joint_type)
+        resolved_joint_type = _normalize_resolved_joint_type(None if resolved_joint is None else resolved_joint.get("type"))
+        if requested_joint_type is not None and requested_joint_type != resolved_joint_type:
+            result = _joint_type_mismatch_result(
+                gapart_id=gapart_id,
+                object_path=args.object_path,
+                task_root=args.task_root,
+                save_root=gym.save_root,
+                requested_joint_type=requested_joint_type,
+                resolved_joint_type=resolved_joint_type,
+                tested_part_id=args.part_id,
+                selected_bbox_id=bbox_id,
+                selected_source=selected_source,
+                selected_link=selected_link,
+                selected_category=selected_category,
+                resolved_joint=resolved_joint,
+            )
+            _write_attempt_result(gym.save_root, result)
+            print(f"[DIAG] requested_joint_type={requested_joint_type} mismatches resolved_joint_type={resolved_joint_type}; stop operation")
+            gym.clean_up()
+            del gym
+            continue
         movable_bbox_id = bbox_id
         if resolved_joint is not None and resolved_joint.get("movable_link"):
             for anno_i, anno in enumerate(gapart_raw_valid_anno):
@@ -1141,6 +1351,27 @@ elif args.mode == "run_arti_open":
         dof_initial = _get_arti_dof_positions(gym)
         print(f"[DIAG] movable joint names:   {movable_joint_names}, target_dof_index={target_dof_index}")
         print(_format_arti_dof_diag("initial", dof_initial, joint_desc=joint_desc, target_dof_index=target_dof_index))
+        if args.save_video and resolved_joint is not None and hasattr(gym, "set_video_axis_overlays"):
+            joint_frame_asset = _joint_frame_in_asset(object_dir, resolved_joint.get("name"))
+            joint_frame_world = _asset_frame_to_world(
+                joint_frame_asset,
+                gym.arti_init_obj_pos_list[0],
+                gym.arti_init_obj_rot_list[0],
+                cfgs["asset"]["arti_obj_scale"],
+            )
+            gym.set_video_axis_overlays([
+                {"label": "world frame", "origin": [0.0, 0.0, 0.0], "axes": np.eye(3, dtype=np.float32), "length": 0.35},
+                {
+                    "label": "joint frame",
+                    "origin": joint_frame_world[:3, 3].astype(float).tolist(),
+                    "axes": joint_frame_world[:3, :3].astype(float).tolist(),
+                    "length": 0.25,
+                },
+            ])
+            print("[DIAG] video axis overlays enabled in world coordinates")
+            print("[DIAG] world frame origin=[0,0,0], axes=identity")
+            print(f"[DIAG] joint frame origin(world)={joint_frame_world[:3, 3]}")
+            print(f"[DIAG] joint frame axes(world columns)=\n{joint_frame_world[:3, :3]}")
 
         pre_grasp_position, grasp_position, pull_targets = _legacy_open_demo_targets(init_position, handle_out_)
         print(f"[DIAG] legacy pre_grasp target: {pre_grasp_position}")
@@ -1196,7 +1427,7 @@ elif args.mode == "run_arti_open":
 
         video_result = None
         if args.save_video:
-            video_result = _write_video_mp4_from_frames(gym.save_root, output_name="manipulation.mp4")
+            video_result = _write_video_mp4_from_frame_list(gym.save_root, getattr(gym, "video_frames", []), output_name="manipulation.mp4")
         video_path = (video_result or {}).get("path") or os.path.join(gym.save_root, "manipulation.mp4")
         frame_metadata = (video_result or {}).get("frame_metadata") or _frame_sequence_metadata(gym.save_root, extension="png")
         video_metadata = (video_result or {}).get("video_metadata") or _probe_video_metadata(video_path)
@@ -1213,8 +1444,11 @@ elif args.mode == "run_arti_open":
             "save_root": gym.save_root,
             "mode": args.mode,
             "save_video": bool(args.save_video),
-            "frame_extension": "png",
+            "save_video_frames": bool(args.save_video_frames),
+            "frame_extension": "png" if args.save_video_frames else None,
             "control_profile": "c8d4ad2_legacy_run_arti_open",
+            "requested_joint_type": requested_joint_type,
+            "resolved_joint_type": resolved_joint_type,
             "legacy_bbox_id": -1,
             "tested_part_id": int(args.part_id) if args.part_id is not None else None,
             "selected_bbox_id": int(bbox_id),
@@ -1245,9 +1479,11 @@ elif args.mode == "run_arti_open":
             "target_dof_index": target_dof_index,
         }
         _write_attempt_result(gym.save_root, result)
-        gym.clean_up()
-        del gym
-        continue
+        if requested_joint_type is None:
+            gym.clean_up()
+            del gym
+            continue
+        print(f"[DIAG] requested_joint_type={requested_joint_type}; continue with joint-aware manipulation path")
         
         # Root-cause note for the 41510 closed-state regression: the failing
         # closed-state run keeps joint_1 near zero but has joint_0 at a very
@@ -1476,7 +1712,7 @@ elif args.mode == "run_arti_open":
                 print(f"[DIAG] selected attempt={cand_label} target_abs_delta={attempt_delta:.6f} best={best_label}:{best_delta:.6f}")
                 break
             if args.save_video:
-                removed_frames = _discard_video_frames_from(gym.save_root, attempt_start_step)
+                removed_frames = _discard_video_frames_from(gym.save_root, attempt_start_step, getattr(gym, "video_frames", None))
                 print(f"[DIAG] discarded {removed_frames} video frames from failed attempt={cand_label}")
                 step_num = attempt_start_step
 
@@ -1530,7 +1766,7 @@ elif args.mode == "run_arti_open":
         print(f"[DIAG] gripper_on_handle={gripper_on_handle} status={status} failure_reason={failure_reason}")
         video_result = None
         if args.save_video:
-            video_result = _write_video_mp4_from_frames(gym.save_root, output_name="manipulation.mp4")
+            video_result = _write_video_mp4_from_frame_list(gym.save_root, getattr(gym, "video_frames", []), output_name="manipulation.mp4")
         video_path = (video_result or {}).get("path") or os.path.join(gym.save_root, "manipulation.mp4")
         frame_metadata = (video_result or {}).get("frame_metadata") or _frame_sequence_metadata(gym.save_root, extension="png")
         video_metadata = (video_result or {}).get("video_metadata") or _probe_video_metadata(video_path)
@@ -1542,8 +1778,11 @@ elif args.mode == "run_arti_open":
             "save_root": gym.save_root,
             "mode": args.mode,
             "save_video": bool(args.save_video),
-            "frame_extension": "png",
+            "save_video_frames": bool(args.save_video_frames),
+            "frame_extension": "png" if args.save_video_frames else None,
             "baseline_success_standard": "old_video" if gapart_id == "45661" else "joint_delta_and_gripper_on_handle",
+            "requested_joint_type": requested_joint_type,
+            "resolved_joint_type": resolved_joint_type,
             "legacy_baseline": legacy_baseline,
             "tested_part_id": int(args.part_id) if args.part_id is not None else None,
             "selected_bbox_id": int(bbox_id),
