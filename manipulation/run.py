@@ -1866,6 +1866,9 @@ elif args.mode == "run_arti_open":
         selected_attempt_stopped_during_pull = False
         joint_aware_attempt_count = 0
         pull_step_gripper_metrics = []
+        stage_feedback = []
+        revolute_target_diagnostics_by_attempt = []
+        selected_revolute_target_diagnostics = None
         for candidate_i, candidate in enumerate(candidates):
             joint_aware_attempt_count += 1
             cand_label = candidate["label"]
@@ -1896,6 +1899,14 @@ elif args.mode == "run_arti_open":
                 record_last_repeat_only=True,
             )
             print(_format_ee_tracking_diag(f"after_pre_grasp[{cand_label}]", gym, pre_grasp_position))
+            stage_feedback.append(_make_stage_feedback(
+                f"after_pre_grasp[{cand_label}]",
+                gym,
+                target_position=pre_grasp_position,
+                dof_now=_get_arti_dof_positions(gym),
+                dof_initial=dof_initial,
+                target_dof_index=target_dof_index,
+            ))
 
             # move the object to the grasp position
             grasp_position = init_position + cand_grasp_offset * approach_dir + cand_bias
@@ -1909,8 +1920,17 @@ elif args.mode == "run_arti_open":
                 step_num=step_num,
                 record_last_repeat_only=True,
             )
+            dof_after_grasp_pose = _get_arti_dof_positions(gym)
             print(_format_ee_tracking_diag(f"after_grasp_pose[{cand_label}]", gym, grasp_position))
-            print(_format_arti_dof_diag(f"after_grasp_pose[{cand_label}]", _get_arti_dof_positions(gym), joint_desc=joint_desc, initial=dof_initial, target_dof_index=target_dof_index))
+            print(_format_arti_dof_diag(f"after_grasp_pose[{cand_label}]", dof_after_grasp_pose, joint_desc=joint_desc, initial=dof_initial, target_dof_index=target_dof_index))
+            stage_feedback.append(_make_stage_feedback(
+                f"after_grasp_pose[{cand_label}]",
+                gym,
+                target_position=grasp_position,
+                dof_now=dof_after_grasp_pose,
+                dof_initial=dof_initial,
+                target_dof_index=target_dof_index,
+            ))
 
             # Keep the gripper closed during articulated manipulation so contacts
             # transmit force through the fingers/handle instead of letting the open
@@ -1918,8 +1938,18 @@ elif args.mode == "run_arti_open":
             close_for_attempt = True
             for i in range(10):
                 step_num = gym.move_gripper(close_gripper = close_for_attempt, save_video=args.save_video, save_root = gym.save_root, start_step = step_num)
+            dof_after_gripper_close = _get_arti_dof_positions(gym)
             print(_format_ee_tracking_diag(f"after_gripper_close[{cand_label}]", gym, grasp_position))
-            print(_format_arti_dof_diag(f"after_gripper_close[{cand_label}]", _get_arti_dof_positions(gym), joint_desc=joint_desc, initial=dof_initial, target_dof_index=target_dof_index))
+            print(_format_arti_dof_diag(f"after_gripper_close[{cand_label}]", dof_after_gripper_close, joint_desc=joint_desc, initial=dof_initial, target_dof_index=target_dof_index))
+            stage_feedback.append(_make_stage_feedback(
+                f"after_gripper_close[{cand_label}]",
+                gym,
+                target_position=grasp_position,
+                dof_now=dof_after_gripper_close,
+                dof_initial=dof_initial,
+                target_dof_index=target_dof_index,
+                handle_bbox=all_bbox_now[bbox_id].cpu().numpy(),
+            ))
 
             # open/pull the articulated part using joint-aware pull direction
             if is_revolute_target:
@@ -1953,17 +1983,30 @@ elif args.mode == "run_arti_open":
                     f"radius={revolute_geom['radius']:.4f}"
                 )
                 hold_steps = 6
-                hold_target = np.asarray(init_position + cand_bias + cand_grasp_offset * approach_dir, dtype=np.float32)
-                hold_targets = np.stack([hold_target for _ in range(hold_steps)], axis=0)
+                breakaway_steps = hold_steps
+                arc_steps = max(revolute_steps - 4, 1)
+                revolute_geom_with_approach = {**revolute_geom, "approach_dir": approach_dir, "breakaway_steps": breakaway_steps}
                 pull_targets = _compute_revolute_grasp_hold_arc_targets(
                     init_position + cand_bias,
                     cand_grasp_offset,
-                    {**revolute_geom, "approach_dir": approach_dir},
+                    revolute_geom_with_approach,
                     hold_steps=hold_steps,
                     angle_step=0.025,
-                    arc_steps=max(revolute_steps - 4, 1),
+                    arc_steps=arc_steps,
                     direction_sign=cand_arc_sign,
                 )
+                revolute_target_diagnostics = _compute_revolute_target_sequence_diagnostics(
+                    init_position + cand_bias,
+                    cand_grasp_offset,
+                    revolute_geom_with_approach,
+                    pull_targets,
+                    hold_steps=hold_steps,
+                    breakaway_steps=breakaway_steps,
+                    arc_steps=arc_steps,
+                    direction_sign=cand_arc_sign,
+                )
+                revolute_target_diagnostics["candidate"] = cand_label
+                revolute_target_diagnostics_by_attempt.append(_json_safe(revolute_target_diagnostics))
             else:
                 pull_targets = _compute_pull_targets(init_position + cand_bias, approach_dir, pull_dir, cand_grasp_offset, pull_step, pull_steps)
             print(f"[DIAG] pull first target[{cand_label}]: {pull_targets[0]}")
@@ -1980,6 +2023,14 @@ elif args.mode == "run_arti_open":
                     dof_now = _get_arti_dof_positions(gym)
                     print(_format_ee_tracking_diag(f"after_pull_step_{i+1}[{cand_label}]", gym, pull_target))
                     print(_format_arti_dof_diag(f"after_pull_step_{i+1}[{cand_label}]", dof_now, joint_desc=joint_desc, initial=dof_initial, target_dof_index=target_dof_index))
+                    stage_feedback.append(_make_stage_feedback(
+                        f"after_pull_step_{i+1}[{cand_label}]",
+                        gym,
+                        target_position=pull_target,
+                        dof_now=dof_now,
+                        dof_initial=dof_initial,
+                        target_dof_index=target_dof_index,
+                    ))
                     if i == early_pull_check_step - 1:
                         early_delta = _target_abs_delta(dof_now, dof_initial, target_dof_index)
                         print(f"[DIAG] early target abs delta[{cand_label}]={early_delta:.6f} threshold={early_success_threshold:.6f}")
@@ -2053,6 +2104,11 @@ elif args.mode == "run_arti_open":
                 selected_attempt_label = cand_label
                 selected_attempt_dof = dof_after_attempt
                 selected_attempt_stopped_during_pull = bool(attempt_reached_success_during_pull)
+                selected_revolute_target_diagnostics = (
+                    revolute_target_diagnostics_by_attempt[-1]
+                    if is_revolute_target and revolute_target_diagnostics_by_attempt
+                    else None
+                )
                 print(f"[DIAG] selected attempt={cand_label} target_abs_delta={attempt_delta:.6f} best={best_label}:{best_delta:.6f}")
                 break
             if args.save_video:
@@ -2080,6 +2136,13 @@ elif args.mode == "run_arti_open":
         final_delta = _target_abs_delta(final_dof, dof_initial, target_dof_index)
         final_stage_label = "success_exit" if early_exit_on_success else "after_settle"
         print(_format_arti_dof_diag(final_stage_label, final_dof, joint_desc=joint_desc, initial=dof_initial, target_dof_index=target_dof_index))
+        stage_feedback.append(_make_stage_feedback(
+            final_stage_label,
+            gym,
+            dof_now=final_dof,
+            dof_initial=dof_initial,
+            target_dof_index=target_dof_index,
+        ))
         initial_target_value = None
         final_target_value = None
         closed_dof_reference = np.asarray(gym.arti_obj_dof_props["lower"], dtype=np.float32)
@@ -2169,6 +2232,9 @@ elif args.mode == "run_arti_open":
             "target_dof_index": target_dof_index,
             "joint_aware_attempt_count": joint_aware_attempt_count,
             "pull_step_gripper_metrics": _json_safe(pull_step_gripper_metrics),
+            "stage_feedback": _json_safe(stage_feedback),
+            "revolute_target_diagnostics": _json_safe(selected_revolute_target_diagnostics),
+            "revolute_target_diagnostics_by_attempt": _json_safe(revolute_target_diagnostics_by_attempt),
             "ever_on_handle_during_pull": bool(any(item.get("on_handle") for item in pull_step_gripper_metrics)),
             "first_on_handle_step": next((item for item in pull_step_gripper_metrics if item.get("on_handle")), None),
             "closest_handle_step": min(pull_step_gripper_metrics, key=lambda item: item.get("metrics", {}).get("finger_midpoint_distance", float("inf"))) if pull_step_gripper_metrics else None,
