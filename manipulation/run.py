@@ -267,7 +267,7 @@ def _orthonormal_frame_from_z(z_axis, x_hint=None):
     return np.stack([x_axis, y_axis, z_axis], axis=1).astype(np.float32)
 
 
-def _compute_revolute_arc_targets(handle_center, grasp_offset, approach_dir, geom, angle_step, steps, direction_sign=1.0):
+def _compute_revolute_arc_targets(handle_center, grasp_offset, approach_dir, geom, angle_step, steps, direction_sign=1.0, start_angle=0.0):
     """Generate end-effector targets following the handle's circular revolute path."""
     handle_center = np.asarray(handle_center, dtype=np.float32)
     approach_dir = _safe_normalize_np(approach_dir)
@@ -275,14 +275,16 @@ def _compute_revolute_arc_targets(handle_center, grasp_offset, approach_dir, geo
     axis_dir = _safe_normalize_np(geom["axis_dir"], fallback=np.array([0.0, 0.0, 1.0], dtype=np.float32))
     radial_dir = _safe_normalize_np(geom["radial_dir"], fallback=np.array([1.0, 0.0, 0.0], dtype=np.float32))
     radius = float(geom["radius"])
-    base_offset = grasp_offset * approach_dir
+    base_offset = float(grasp_offset) * approach_dir
 
     targets = []
-    for step_i in range(steps):
-        theta = (step_i + 1) * angle_step * float(direction_sign)
+    for step_i in range(max(int(steps), 0)):
+        theta = float(start_angle) + (step_i + 1) * float(angle_step) * float(direction_sign)
         rot = R.from_rotvec(axis_dir * theta).as_matrix().astype(np.float32)
         rotated_radial = rot @ radial_dir
         targets.append(pivot + radius * rotated_radial + base_offset)
+    if not targets:
+        return np.zeros((0, 3), dtype=np.float32)
     return np.stack(targets, axis=0).astype(np.float32)
 
 def _parse_urdf_joint_info(object_dir):
@@ -465,49 +467,129 @@ def _compute_revolute_grasp_hold_targets(handle_center, grasp_offset, geom, tang
 
 
 def _compute_revolute_grasp_hold_arc_targets(handle_center, grasp_offset, geom, hold_steps, angle_step, arc_steps, direction_sign=1.0):
-    """Hold the grasp briefly, add a short breakaway, then move along the revolute arc."""
+    """Hold the grasp, then move through continuous circular breakaway and arc targets."""
     geom = dict(geom or {})
     hold_steps = max(int(hold_steps), 0)
     arc_steps = max(int(arc_steps), 0)
-    hold_position = np.asarray(handle_center, dtype=np.float32) + float(grasp_offset) * _safe_normalize_np(
+    approach_dir = _safe_normalize_np(
         geom.get("approach_dir", np.array([-1.0, 0.0, 0.0], dtype=np.float32)),
         fallback=np.array([-1.0, 0.0, 0.0], dtype=np.float32),
     )
-    hold_targets = np.stack([hold_position for _ in range(hold_steps)], axis=0) if hold_steps > 0 else np.zeros((0, 3), dtype=np.float32)
-    breakaway_steps = max(int(geom.get("breakaway_steps", hold_steps)), 0)
-    breakaway_step = float(
-        geom.get(
-            "breakaway_step",
-            max(0.008, 0.5 * abs(float(grasp_offset)) if float(grasp_offset) != 0.0 else 0.008),
-        )
-    )
-    breakaway_targets = (
-        _compute_revolute_grasp_hold_targets(
-            handle_center,
-            grasp_offset,
-            geom,
-            tangent_step=breakaway_step,
-            steps=breakaway_steps,
-            direction_sign=direction_sign,
-        )
-        if breakaway_steps > 0
+    hold_position = np.asarray(handle_center, dtype=np.float32) + float(grasp_offset) * approach_dir
+    hold_targets = (
+        np.stack([hold_position for _ in range(hold_steps)], axis=0).astype(np.float32)
+        if hold_steps > 0
         else np.zeros((0, 3), dtype=np.float32)
     )
+
+    breakaway_steps = max(int(geom.get("breakaway_steps", hold_steps)), 0)
+    breakaway_targets = _compute_revolute_arc_targets(
+        handle_center,
+        grasp_offset,
+        approach_dir,
+        geom,
+        angle_step,
+        breakaway_steps,
+        direction_sign=direction_sign,
+        start_angle=0.0,
+    )
+    arc_start_angle = breakaway_steps * float(angle_step) * float(direction_sign)
     arc_targets = _compute_revolute_arc_targets(
         handle_center,
         grasp_offset,
-        geom.get("approach_dir", np.array([-1.0, 0.0, 0.0], dtype=np.float32)),
+        approach_dir,
         geom,
         angle_step,
         arc_steps,
         direction_sign=direction_sign,
+        start_angle=arc_start_angle,
     )
     pieces = [piece for piece in (hold_targets, breakaway_targets, arc_targets) if piece.size > 0]
     if not pieces:
         return np.zeros((0, 3), dtype=np.float32)
     if len(pieces) == 1:
         return pieces[0]
-    return np.concatenate(pieces, axis=0)
+    return np.concatenate(pieces, axis=0).astype(np.float32)
+
+
+def _revolute_signed_angles_for_targets(targets, grasp_offset, geom):
+    """Return signed target angles in the local revolute frame."""
+    targets = np.asarray(targets, dtype=np.float32).reshape(-1, 3)
+    if targets.size == 0:
+        return np.zeros((0,), dtype=np.float32)
+    approach_dir = _safe_normalize_np(
+        geom.get("approach_dir", np.array([-1.0, 0.0, 0.0], dtype=np.float32)),
+        fallback=np.array([-1.0, 0.0, 0.0], dtype=np.float32),
+    )
+    pivot = np.asarray(geom["pivot"], dtype=np.float32)
+    radial_dir = _safe_normalize_np(geom["radial_dir"], fallback=np.array([1.0, 0.0, 0.0], dtype=np.float32))
+    tangent_dir = _safe_normalize_np(geom.get("tangent_dir"), fallback=np.array([0.0, 1.0, 0.0], dtype=np.float32))
+    handle_points = targets - float(grasp_offset) * approach_dir
+    rel = handle_points - pivot
+    x = rel @ radial_dir
+    y = rel @ tangent_dir
+    return np.unwrap(np.arctan2(y, x)).astype(np.float32)
+
+
+def _compute_revolute_target_sequence_diagnostics(
+    handle_center,
+    grasp_offset,
+    geom,
+    targets,
+    hold_steps,
+    breakaway_steps,
+    arc_steps,
+    direction_sign=1.0,
+):
+    """Summarize target sequence continuity before executing it."""
+    targets = np.asarray(targets, dtype=np.float32).reshape(-1, 3)
+    hold_steps = max(int(hold_steps), 0)
+    breakaway_steps = max(int(breakaway_steps), 0)
+    arc_steps = max(int(arc_steps), 0)
+    approach_dir = _safe_normalize_np(
+        geom.get("approach_dir", np.array([-1.0, 0.0, 0.0], dtype=np.float32)),
+        fallback=np.array([-1.0, 0.0, 0.0], dtype=np.float32),
+    )
+    grasp_position = np.asarray(handle_center, dtype=np.float32) + float(grasp_offset) * approach_dir
+    adjacent_distances = (
+        np.linalg.norm(np.diff(targets, axis=0), axis=1)
+        if len(targets) > 1
+        else np.zeros((0,), dtype=np.float32)
+    )
+    moving_targets = targets[hold_steps:] if hold_steps < len(targets) else np.zeros((0, 3), dtype=np.float32)
+    angles = _revolute_signed_angles_for_targets(moving_targets, grasp_offset, geom)
+    signed_step_progress = np.diff(np.concatenate(([0.0], angles))).astype(np.float32) if len(angles) else np.zeros((0,), dtype=np.float32)
+    direction = 1.0 if float(direction_sign) >= 0 else -1.0
+    monotonic = bool(np.all(direction * signed_step_progress >= -1e-5)) if len(signed_step_progress) else True
+    first_non_hold_distance = (
+        float(np.linalg.norm(moving_targets[0] - grasp_position))
+        if len(moving_targets)
+        else 0.0
+    )
+    transition_index = hold_steps + breakaway_steps - 1
+    if breakaway_steps > 0 and arc_steps > 0 and 0 <= transition_index < len(targets) - 1:
+        breakaway_to_arc = float(np.linalg.norm(targets[transition_index + 1] - targets[transition_index]))
+    else:
+        breakaway_to_arc = 0.0
+    return {
+        "grasp_target": grasp_position.astype(float).tolist(),
+        "hold_target_count": hold_steps,
+        "breakaway_target_count": breakaway_steps,
+        "arc_target_count": arc_steps,
+        "first_pull_target": targets[0].astype(float).tolist() if len(targets) else None,
+        "final_pull_target": targets[-1].astype(float).tolist() if len(targets) else None,
+        "max_adjacent_target_distance": float(np.max(adjacent_distances)) if len(adjacent_distances) else 0.0,
+        "breakaway_to_arc_transition_distance": breakaway_to_arc,
+        "first_non_hold_distance_from_grasp": first_non_hold_distance,
+        "arc_angle_monotonic": monotonic,
+        "signed_angular_progress": {
+            "direction_sign": float(direction_sign),
+            "first": float(angles[0]) if len(angles) else 0.0,
+            "final": float(angles[-1]) if len(angles) else 0.0,
+            "min_step": float(np.min(signed_step_progress)) if len(signed_step_progress) else 0.0,
+            "max_step": float(np.max(signed_step_progress)) if len(signed_step_progress) else 0.0,
+        },
+    }
 
 
 def _legacy_open_demo_targets(init_position, handle_out):
