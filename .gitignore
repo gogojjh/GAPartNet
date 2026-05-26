@@ -17,6 +17,7 @@ openspec/
 docs/
 .codex/
 .agents/
+.worktrees/
 
 # Build artifacts
 pointnet2_ops_lib/build/
