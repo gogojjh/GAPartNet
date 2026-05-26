@@ -239,6 +239,68 @@ def test_compute_revolute_arc_targets_follow_circular_arc():
     assert np.allclose(targets[1], [np.cos(0.2), np.sin(0.2), 0.0], atol=1e-5)
 
 
+def test_revolute_arc_targets_zero_steps_do_not_require_geometry():
+    helpers = load_helpers()
+
+    targets = helpers._compute_revolute_arc_targets(
+        handle_center=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        grasp_offset=0.0,
+        approach_dir=np.array([0.0, 0.0, 1.0], dtype=np.float32),
+        geom={},
+        angle_step=0.1,
+        steps=0,
+    )
+
+    assert targets.shape == (0, 3)
+    assert targets.dtype == np.float32
+
+
+def test_revolute_hold_only_targets_do_not_require_arc_geometry():
+    helpers = load_helpers()
+
+    targets = helpers._compute_revolute_grasp_hold_arc_targets(
+        handle_center=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        grasp_offset=0.05,
+        geom={
+            "approach_dir": np.array([0.0, 0.0, 1.0], dtype=np.float32),
+            "breakaway_steps": 0,
+        },
+        hold_steps=2,
+        angle_step=0.025,
+        arc_steps=0,
+    )
+
+    assert targets.shape == (2, 3)
+    assert np.allclose(targets, [[1.0, 0.0, 0.05], [1.0, 0.0, 0.05]])
+
+
+def test_revolute_breakaway_step_sets_circular_breakaway_angle():
+    helpers = load_helpers()
+    geom = {
+        "pivot": np.array([0.0, 0.0, 0.0], dtype=np.float32),
+        "axis_dir": np.array([0.0, 0.0, 1.0], dtype=np.float32),
+        "radial_dir": np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        "tangent_dir": np.array([0.0, 1.0, 0.0], dtype=np.float32),
+        "radius": 2.0,
+        "approach_dir": np.array([0.0, 0.0, 1.0], dtype=np.float32),
+        "breakaway_steps": 2,
+        "breakaway_step": 0.1,
+    }
+
+    targets = helpers._compute_revolute_grasp_hold_arc_targets(
+        handle_center=np.array([2.0, 0.0, 0.0], dtype=np.float32),
+        grasp_offset=0.05,
+        geom=geom,
+        hold_steps=0,
+        angle_step=0.2,
+        arc_steps=1,
+        direction_sign=1.0,
+    )
+    angles = helpers._revolute_signed_angles_for_targets(targets, 0.05, geom)
+
+    assert np.allclose(angles, [0.05, 0.10, 0.30], atol=1e-5)
+
+
 def test_revolute_hold_breakaway_arc_targets_are_continuous():
     helpers = load_helpers()
     geom = {

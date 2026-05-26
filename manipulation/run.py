@@ -269,6 +269,9 @@ def _orthonormal_frame_from_z(z_axis, x_hint=None):
 
 def _compute_revolute_arc_targets(handle_center, grasp_offset, approach_dir, geom, angle_step, steps, direction_sign=1.0, start_angle=0.0):
     """Generate end-effector targets following the handle's circular revolute path."""
+    steps = max(int(steps), 0)
+    if steps == 0:
+        return np.zeros((0, 3), dtype=np.float32)
     handle_center = np.asarray(handle_center, dtype=np.float32)
     approach_dir = _safe_normalize_np(approach_dir)
     pivot = np.asarray(geom["pivot"], dtype=np.float32)
@@ -278,13 +281,11 @@ def _compute_revolute_arc_targets(handle_center, grasp_offset, approach_dir, geo
     base_offset = float(grasp_offset) * approach_dir
 
     targets = []
-    for step_i in range(max(int(steps), 0)):
+    for step_i in range(steps):
         theta = float(start_angle) + (step_i + 1) * float(angle_step) * float(direction_sign)
         rot = R.from_rotvec(axis_dir * theta).as_matrix().astype(np.float32)
         rotated_radial = rot @ radial_dir
         targets.append(pivot + radius * rotated_radial + base_offset)
-    if not targets:
-        return np.zeros((0, 3), dtype=np.float32)
     return np.stack(targets, axis=0).astype(np.float32)
 
 def _parse_urdf_joint_info(object_dir):
@@ -483,17 +484,25 @@ def _compute_revolute_grasp_hold_arc_targets(handle_center, grasp_offset, geom, 
     )
 
     breakaway_steps = max(int(geom.get("breakaway_steps", hold_steps)), 0)
+    radius = abs(float(geom.get("radius", 0.0)))
+    breakaway_step = float(
+        geom.get(
+            "breakaway_step",
+            max(0.008, 0.5 * abs(float(grasp_offset)) if float(grasp_offset) != 0.0 else 0.008),
+        )
+    )
+    breakaway_angle_step = breakaway_step / radius if radius > 1e-6 else float(angle_step)
     breakaway_targets = _compute_revolute_arc_targets(
         handle_center,
         grasp_offset,
         approach_dir,
         geom,
-        angle_step,
+        breakaway_angle_step,
         breakaway_steps,
         direction_sign=direction_sign,
         start_angle=0.0,
     )
-    arc_start_angle = breakaway_steps * float(angle_step) * float(direction_sign)
+    arc_start_angle = breakaway_steps * float(breakaway_angle_step) * float(direction_sign)
     arc_targets = _compute_revolute_arc_targets(
         handle_center,
         grasp_offset,
@@ -514,6 +523,7 @@ def _compute_revolute_grasp_hold_arc_targets(handle_center, grasp_offset, geom, 
 
 def _revolute_signed_angles_for_targets(targets, grasp_offset, geom):
     """Return signed target angles in the local revolute frame."""
+    geom = dict(geom or {})
     targets = np.asarray(targets, dtype=np.float32).reshape(-1, 3)
     if targets.size == 0:
         return np.zeros((0,), dtype=np.float32)
@@ -521,8 +531,8 @@ def _revolute_signed_angles_for_targets(targets, grasp_offset, geom):
         geom.get("approach_dir", np.array([-1.0, 0.0, 0.0], dtype=np.float32)),
         fallback=np.array([-1.0, 0.0, 0.0], dtype=np.float32),
     )
-    pivot = np.asarray(geom["pivot"], dtype=np.float32)
-    radial_dir = _safe_normalize_np(geom["radial_dir"], fallback=np.array([1.0, 0.0, 0.0], dtype=np.float32))
+    pivot = np.asarray(geom.get("pivot", np.zeros(3, dtype=np.float32)), dtype=np.float32)
+    radial_dir = _safe_normalize_np(geom.get("radial_dir"), fallback=np.array([1.0, 0.0, 0.0], dtype=np.float32))
     tangent_dir = _safe_normalize_np(geom.get("tangent_dir"), fallback=np.array([0.0, 1.0, 0.0], dtype=np.float32))
     handle_points = targets - float(grasp_offset) * approach_dir
     rel = handle_points - pivot
