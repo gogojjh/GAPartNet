@@ -15,7 +15,10 @@ HELPERS = {
     "_project_point_to_axis",
     "_compute_revolute_motion_geometry",
     "_compute_revolute_arc_targets",
+    "_compute_revolute_target_sequence_diagnostics",
+    "_revolute_signed_angles_for_targets",
     "_compute_revolute_grasp_hold_targets",
+    "_compute_revolute_grasp_hold_arc_targets",
     "_estimate_revolute_axis_point_from_bbox",
     "_orthonormal_frame_from_z",
     "_rotation_from_link_to_root",
@@ -234,6 +237,88 @@ def test_compute_revolute_arc_targets_follow_circular_arc():
     assert targets.shape == (2, 3)
     assert np.allclose(targets[0], [np.cos(0.1), np.sin(0.1), 0.0], atol=1e-5)
     assert np.allclose(targets[1], [np.cos(0.2), np.sin(0.2), 0.0], atol=1e-5)
+
+
+def test_revolute_hold_breakaway_arc_targets_are_continuous():
+    helpers = load_helpers()
+    geom = {
+        "pivot": np.array([0.0, 0.0, 0.0], dtype=np.float32),
+        "axis_dir": np.array([0.0, 0.0, 1.0], dtype=np.float32),
+        "radial_dir": np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        "tangent_dir": np.array([0.0, 1.0, 0.0], dtype=np.float32),
+        "radius": 1.0,
+        "approach_dir": np.array([0.0, 0.0, 1.0], dtype=np.float32),
+        "breakaway_steps": 2,
+    }
+
+    targets = helpers._compute_revolute_grasp_hold_arc_targets(
+        handle_center=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        grasp_offset=0.05,
+        geom=geom,
+        hold_steps=2,
+        angle_step=0.025,
+        arc_steps=4,
+        direction_sign=1.0,
+    )
+    grasp = np.array([1.0, 0.0, 0.05], dtype=np.float32)
+    diagnostics = helpers._compute_revolute_target_sequence_diagnostics(
+        handle_center=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        grasp_offset=0.05,
+        geom=geom,
+        targets=targets,
+        hold_steps=2,
+        breakaway_steps=2,
+        arc_steps=4,
+        direction_sign=1.0,
+    )
+
+    assert targets.shape == (8, 3)
+    assert np.allclose(targets[0], grasp)
+    assert np.allclose(targets[1], grasp)
+    assert diagnostics["first_non_hold_distance_from_grasp"] < 0.03
+    assert diagnostics["breakaway_to_arc_transition_distance"] < 0.03
+    assert diagnostics["max_adjacent_target_distance"] < 0.03
+    assert diagnostics["arc_angle_monotonic"] is True
+    assert diagnostics["hold_target_count"] == 2
+    assert diagnostics["breakaway_target_count"] == 2
+    assert diagnostics["arc_target_count"] == 4
+
+
+def test_revolute_target_sequence_diagnostics_support_negative_direction():
+    helpers = load_helpers()
+    geom = {
+        "pivot": np.array([0.0, 0.0, 0.0], dtype=np.float32),
+        "axis_dir": np.array([0.0, 0.0, 1.0], dtype=np.float32),
+        "radial_dir": np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        "tangent_dir": np.array([0.0, 1.0, 0.0], dtype=np.float32),
+        "radius": 1.0,
+        "approach_dir": np.array([0.0, 0.0, 1.0], dtype=np.float32),
+        "breakaway_steps": 2,
+    }
+
+    targets = helpers._compute_revolute_grasp_hold_arc_targets(
+        handle_center=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        grasp_offset=0.05,
+        geom=geom,
+        hold_steps=1,
+        angle_step=0.025,
+        arc_steps=4,
+        direction_sign=-1.0,
+    )
+    diagnostics = helpers._compute_revolute_target_sequence_diagnostics(
+        handle_center=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        grasp_offset=0.05,
+        geom=geom,
+        targets=targets,
+        hold_steps=1,
+        breakaway_steps=2,
+        arc_steps=4,
+        direction_sign=-1.0,
+    )
+
+    assert diagnostics["arc_angle_monotonic"] is True
+    assert diagnostics["signed_angular_progress"]["final"] < 0.0
+    assert diagnostics["signed_angular_progress"]["direction_sign"] == -1.0
 
 
 
