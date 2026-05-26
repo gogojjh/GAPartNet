@@ -1229,6 +1229,27 @@ def _reset_video_capture_buffer(gym, remove_disk_frames=False):
     return removed
 
 
+def _capture_initial_static_video_frames(gym, save_video, save_root, step_num, frame_count=30):
+    """Record a short static prefix before any manipulation motion."""
+    if not save_video:
+        return step_num, {
+            "video_capture_start_stage": None,
+            "initial_static_frame_count": 0,
+            "initial_static_frames_preserved": False,
+        }
+    frame_count = max(int(frame_count), 0)
+    if hasattr(gym, "refresh_observation"):
+        gym.refresh_observation(get_visual_obs=False)
+    for frame_i in range(frame_count):
+        gym.gym.render_all_camera_sensors(gym.sim)
+        gym.record_camera_frame(save_root, step_num + frame_i)
+    return step_num + frame_count, {
+        "video_capture_start_stage": "post_closed_reset_static",
+        "initial_static_frame_count": frame_count,
+        "initial_static_frames_preserved": True,
+    }
+
+
 def _control_to_pose_repeated_ik(
     gym,
     pose,
@@ -1802,6 +1823,14 @@ elif args.mode == "run_arti_open":
         print(f"[DIAG] requested_joint_type={requested_joint_type}; skip legacy straight-line demo and start joint-aware manipulation path")
         if removed_video_frames:
             print(f"[DIAG] cleared {removed_video_frames} stale video frame files before joint-aware recording")
+        step_num = 0
+        step_num, video_capture_metadata = _capture_initial_static_video_frames(
+            gym,
+            save_video=args.save_video,
+            save_root=gym.save_root,
+            step_num=step_num,
+            frame_count=30,
+        )
         
         # Root-cause note for the 41510 closed-state regression: the failing
         # closed-state run keeps joint_1 near zero but has joint_0 at a very
@@ -1855,7 +1884,6 @@ elif args.mode == "run_arti_open":
                     candidates.append(minus)
         print(f"[DIAG] grasp candidates:    {[c['label'] for c in candidates]}")
 
-        step_num = 0
         best_delta = -1.0
         best_label = None
         selected_revolute_axis_point = None
@@ -2195,6 +2223,7 @@ elif args.mode == "run_arti_open":
             "save_video": bool(args.save_video),
             "save_video_frames": bool(args.save_video_frames),
             "frame_extension": "png" if args.save_video_frames else None,
+            **video_capture_metadata,
             **_make_control_profile_metadata(requested_joint_type, legacy_demo_executed),
             "baseline_success_standard": "old_video" if gapart_id == "45661" else "joint_delta_and_gripper_on_handle",
             "requested_joint_type": requested_joint_type,

@@ -48,6 +48,7 @@ HELPERS = {
     "_joint_type_mismatch_result",
     "_should_run_legacy_open_demo",
     "_reset_video_capture_buffer",
+    "_capture_initial_static_video_frames",
     "_make_control_profile_metadata",
 }
 
@@ -726,6 +727,69 @@ def test_reset_video_capture_buffer_clears_memory_and_disk_frames(tmp_path):
     assert removed == 2
     assert gym.video_frames == []
     assert list(video_dir.glob("step-*.png")) == []
+
+
+def test_capture_initial_static_video_frames_records_metadata_and_steps():
+    helpers = load_helpers()
+
+    class CameraAPI:
+        def __init__(self):
+            self.render_calls = 0
+
+        def render_all_camera_sensors(self, sim):
+            self.render_calls += 1
+
+    class DummyGym:
+        def __init__(self):
+            self.gym = CameraAPI()
+            self.sim = object()
+            self.recorded_steps = []
+
+        def refresh_observation(self, get_visual_obs=False):
+            self.refreshed = True
+
+        def record_camera_frame(self, save_root, step):
+            self.recorded_steps.append((save_root, step))
+
+    gym = DummyGym()
+    next_step, metadata = helpers._capture_initial_static_video_frames(
+        gym,
+        save_video=True,
+        save_root="/tmp/static-video",
+        step_num=7,
+        frame_count=3,
+    )
+
+    assert next_step == 10
+    assert gym.gym.render_calls == 3
+    assert gym.recorded_steps == [("/tmp/static-video", 7), ("/tmp/static-video", 8), ("/tmp/static-video", 9)]
+    assert metadata == {
+        "video_capture_start_stage": "post_closed_reset_static",
+        "initial_static_frame_count": 3,
+        "initial_static_frames_preserved": True,
+    }
+
+
+def test_capture_initial_static_video_frames_noops_when_video_disabled():
+    helpers = load_helpers()
+
+    class DummyGym:
+        pass
+
+    next_step, metadata = helpers._capture_initial_static_video_frames(
+        DummyGym(),
+        save_video=False,
+        save_root="/tmp/static-video",
+        step_num=7,
+        frame_count=3,
+    )
+
+    assert next_step == 7
+    assert metadata == {
+        "video_capture_start_stage": None,
+        "initial_static_frame_count": 0,
+        "initial_static_frames_preserved": False,
+    }
 
 
 def test_json_safe_converts_numpy_values():
