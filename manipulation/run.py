@@ -881,6 +881,69 @@ def _write_video_mp4_from_frame_list(save_root, frames, output_name="manipulatio
     height, width = first.shape[:2]
     result["frame_metadata"].update({"height": int(height), "width": int(width)})
     os.makedirs(save_root, exist_ok=True)
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-f",
+        "rawvideo",
+        "-vcodec",
+        "rawvideo",
+        "-pix_fmt",
+        "bgr24",
+        "-s",
+        f"{width}x{height}",
+        "-r",
+        str(fps),
+        "-i",
+        "-",
+        "-an",
+        "-vcodec",
+        "mpeg4",
+        "-pix_fmt",
+        "yuv420p",
+        output_path,
+    ]
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        written = 0
+        try:
+            for frame in frames:
+                frame = np.asarray(frame)
+                if frame.ndim != 3 or frame.shape[2] < 3:
+                    result["warnings"].append(f"skipped_invalid_frame_shape: {frame.shape}")
+                    continue
+                frame = frame[:, :, :3]
+                if frame.shape[:2] != (height, width):
+                    frame = cv2.resize(frame, (width, height))
+                if frame.dtype != np.uint8:
+                    frame = np.clip(frame, 0, 255).astype(np.uint8)
+                process.stdin.write(np.ascontiguousarray(frame).tobytes())
+                written += 1
+            process.stdin.close()
+        except Exception:
+            if process.stdin and not process.stdin.closed:
+                process.stdin.close()
+            process.kill()
+            process.wait()
+            raise
+        returncode = process.wait()
+        if returncode != 0:
+            raise RuntimeError(f"ffmpeg exited with {returncode}")
+        result["writer"] = "ffmpeg_rawvideo"
+        result["frame_metadata"]["count"] = written
+        result["video_metadata"] = _probe_video_metadata(output_path)
+        if result["video_metadata"].get("nb_frames", 0) and result["video_metadata"].get("width"):
+            print(f"[DIAG] wrote complete mp4 from memory with ffmpeg: {output_path}")
+            return result
+        result["warnings"].append("ffmpeg_rawvideo_unreadable_output")
+    except Exception as exc:
+        result["warnings"].append(f"ffmpeg_rawvideo_failed: {exc}")
+
     writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), float(fps), (width, height))
     if not writer.isOpened():
         result["warnings"].append(f"opencv_videowriter_failed: {output_path}")
@@ -902,6 +965,8 @@ def _write_video_mp4_from_frame_list(save_root, frames, output_name="manipulatio
     result["writer"] = "opencv_mp4v"
     result["frame_metadata"]["count"] = written
     result["video_metadata"] = _probe_video_metadata(output_path)
+    if not result["video_metadata"].get("nb_frames"):
+        result["warnings"].append("opencv_mp4v_unreadable_output")
     print(f"[DIAG] wrote complete mp4 from memory: {output_path}")
     return result
 
@@ -1028,6 +1093,15 @@ def _discard_video_frames_from(save_root, start_step, frame_buffer=None):
     return removed
 
 
+def _reset_video_capture_buffer(gym, remove_disk_frames=False):
+    removed = 0
+    if hasattr(gym, "video_frames"):
+        del gym.video_frames[:]
+    if remove_disk_frames:
+        removed = _discard_video_frames_from(gym.save_root, 0, None)
+    return removed
+
+
 def _control_to_pose_repeated_ik(
     gym,
     pose,
@@ -1066,6 +1140,22 @@ def _normalize_requested_joint_type(joint_type):
     return normalized
 
 
+def _should_run_legacy_open_demo(requested_joint_type):
+    return requested_joint_type is None
+
+
+def _make_control_profile_metadata(requested_joint_type, legacy_demo_executed):
+    control_profile = (
+        "c8d4ad2_legacy_run_arti_open"
+        if requested_joint_type is None
+        else "joint_aware_run_arti_open"
+    )
+    return {
+        "control_profile": control_profile,
+        "legacy_demo_executed": bool(legacy_demo_executed),
+    }
+
+
 def _normalize_resolved_joint_type(joint_type):
     if joint_type is None:
         return None
@@ -1099,6 +1189,7 @@ def _joint_type_mismatch_result(
         "mode": "run_arti_open",
         "status": "failure",
         "failure_reason": "requested_joint_type_mismatch",
+        **_make_control_profile_metadata(requested_joint_type, legacy_demo_executed=False),
         "requested_joint_type": requested_joint_type,
         "resolved_joint_type": resolved_joint_type,
         "tested_part_id": int(tested_part_id) if tested_part_id is not None else None,
@@ -1456,129 +1547,134 @@ elif args.mode == "run_arti_open":
             print(f"[DIAG] joint frame origin(world)={joint_frame_world[:3, 3]}")
             print(f"[DIAG] joint frame axes(world columns)=\n{joint_frame_world[:3, :3]}")
 
-        pre_grasp_position, grasp_position, pull_targets = _legacy_open_demo_targets(init_position, handle_out_)
-        print(f"[DIAG] legacy pre_grasp target: {pre_grasp_position}")
-        print(f"[DIAG] legacy grasp target:     {grasp_position}")
-        print(f"[DIAG] legacy pull first/final: {pull_targets[0]} -> {pull_targets[-1]}")
+        legacy_demo_executed = False
+        if _should_run_legacy_open_demo(requested_joint_type):
+            legacy_demo_executed = True
+            pre_grasp_position, grasp_position, pull_targets = _legacy_open_demo_targets(init_position, handle_out_)
+            print(f"[DIAG] legacy pre_grasp target: {pre_grasp_position}")
+            print(f"[DIAG] legacy grasp target:     {grasp_position}")
+            print(f"[DIAG] legacy pull first/final: {pull_targets[0]} -> {pull_targets[-1]}")
 
-        step_num = 0
-        for i in range(10):
-            step_num, traj = gym.control_to_pose(
-                np.array([*pre_grasp_position, *(rotations[bbox_id].cpu().numpy())]),
-                close_gripper=False,
-                save_video=args.save_video,
-                save_root=gym.save_root,
-                step_num=step_num,
-                use_ik=True,
-            )
+            step_num = 0
+            for i in range(10):
+                step_num, traj = gym.control_to_pose(
+                    np.array([*pre_grasp_position, *(rotations[bbox_id].cpu().numpy())]),
+                    close_gripper=False,
+                    save_video=args.save_video,
+                    save_root=gym.save_root,
+                    step_num=step_num,
+                    use_ik=True,
+                )
 
-        for i in range(10):
-            step_num, traj = gym.control_to_pose(
-                np.array([*grasp_position, *(rotations[bbox_id].cpu().numpy())]),
-                close_gripper=False,
-                save_video=args.save_video,
-                save_root=gym.save_root,
-                step_num=step_num,
-                use_ik=True,
-            )
+            for i in range(10):
+                step_num, traj = gym.control_to_pose(
+                    np.array([*grasp_position, *(rotations[bbox_id].cpu().numpy())]),
+                    close_gripper=False,
+                    save_video=args.save_video,
+                    save_root=gym.save_root,
+                    step_num=step_num,
+                    use_ik=True,
+                )
 
-        for i in range(10):
-            step_num = gym.move_gripper(
-                close_gripper=True,
-                save_video=args.save_video,
-                save_root=gym.save_root,
-                start_step=step_num,
-            )
+            for i in range(10):
+                step_num = gym.move_gripper(
+                    close_gripper=True,
+                    save_video=args.save_video,
+                    save_root=gym.save_root,
+                    start_step=step_num,
+                )
 
-        for pull_target in pull_targets:
-            step_num, traj = gym.control_to_pose(
-                np.array([*pull_target, *(rotations[bbox_id].cpu().numpy())]),
-                close_gripper=True,
-                save_video=args.save_video,
-                save_root=gym.save_root,
-                step_num=step_num,
-                use_ik=True,
-            )
+            for pull_target in pull_targets:
+                step_num, traj = gym.control_to_pose(
+                    np.array([*pull_target, *(rotations[bbox_id].cpu().numpy())]),
+                    close_gripper=True,
+                    save_video=args.save_video,
+                    save_root=gym.save_root,
+                    step_num=step_num,
+                    use_ik=True,
+                )
 
-        print(f"[DIAG] ee_pos after legacy manipulation: {gym.hand_pos[0].cpu().numpy()}")
-        print(_format_arti_dof_diag("after_legacy_pull", _get_arti_dof_positions(gym), joint_desc=joint_desc, initial=dof_initial, target_dof_index=target_dof_index))
-        print("Finish the manipulation, run the simulation 1000 steps for more visualization")
-        gym.run_steps(pre_steps=1000, refresh_obs=False, print_step=False)
-        final_dof = _get_arti_dof_positions(gym)
-        final_delta = _target_abs_delta(final_dof, dof_initial, target_dof_index)
-        print(_format_arti_dof_diag("after_legacy_settle", final_dof, joint_desc=joint_desc, initial=dof_initial, target_dof_index=target_dof_index))
+            print(f"[DIAG] ee_pos after legacy manipulation: {gym.hand_pos[0].cpu().numpy()}")
+            print(_format_arti_dof_diag("after_legacy_pull", _get_arti_dof_positions(gym), joint_desc=joint_desc, initial=dof_initial, target_dof_index=target_dof_index))
+            print("Finish the manipulation, run the simulation 1000 steps for more visualization")
+            gym.run_steps(pre_steps=1000, refresh_obs=False, print_step=False)
+            final_dof = _get_arti_dof_positions(gym)
+            final_delta = _target_abs_delta(final_dof, dof_initial, target_dof_index)
+            print(_format_arti_dof_diag("after_legacy_settle", final_dof, joint_desc=joint_desc, initial=dof_initial, target_dof_index=target_dof_index))
 
-        video_result = None
-        if args.save_video:
-            video_result = _write_video_mp4_from_frame_list(gym.save_root, getattr(gym, "video_frames", []), output_name="manipulation.mp4")
-        video_path = (video_result or {}).get("path") or os.path.join(gym.save_root, "manipulation.mp4")
-        frame_metadata = (video_result or {}).get("frame_metadata") or _frame_sequence_metadata(gym.save_root, extension="png")
-        video_metadata = (video_result or {}).get("video_metadata") or _probe_video_metadata(video_path)
-        initial_target_value = None
-        final_target_value = None
-        closed_dof_reference = np.asarray(gym.arti_obj_dof_props["lower"], dtype=np.float32)
-        dof_before_closed_reset = _get_arti_dof_positions(gym)
-        closed_reference = _reset_arti_dofs_to_closed(gym)
-        dof_after_closed_reset = _get_arti_dof_positions(gym)
-        closed_init_check = {
-            "before": np.asarray(dof_before_closed_reset).astype(float).tolist(),
-            "after": np.asarray(dof_after_closed_reset).astype(float).tolist(),
-            "closed_reference": np.asarray(closed_reference).astype(float).tolist(),
-            "applied": bool(np.allclose(np.asarray(dof_after_closed_reset), np.asarray(closed_reference), atol=1e-6)),
-            "max_abs_error_after": float(np.max(np.abs(np.asarray(dof_after_closed_reset) - np.asarray(closed_reference)))),
-        }
-        print(f"[DIAG] closed init check: {json.dumps(closed_init_check, sort_keys=True)}")
-        if target_dof_index is not None:
-            initial_target_value = float(np.asarray(dof_initial).reshape(np.asarray(dof_initial).shape[0], -1)[0, target_dof_index])
-            final_target_value = float(np.asarray(final_dof).reshape(np.asarray(final_dof).shape[0], -1)[0, target_dof_index])
-        result = {
-            "asset_id": gapart_id,
-            "object_path": args.object_path,
-            "task_root": args.task_root,
-            "save_root": gym.save_root,
-            "mode": args.mode,
-            "save_video": bool(args.save_video),
-            "save_video_frames": bool(args.save_video_frames),
-            "frame_extension": "png" if args.save_video_frames else None,
-            "control_profile": "c8d4ad2_legacy_run_arti_open",
-            "requested_joint_type": requested_joint_type,
-            "resolved_joint_type": resolved_joint_type,
-            "legacy_bbox_id": -1,
-            "tested_part_id": int(args.part_id) if args.part_id is not None else None,
-            "selected_bbox_id": int(bbox_id),
-            "selected_source": selected_source,
-            "selected_link": selected_link,
-            "selected_category": selected_category,
-            "selected_joint": _json_safe(resolved_joint),
-            "joint_name": None if joint_desc is None else joint_desc.get("name"),
-            "joint_type": None if joint_desc is None else ("revolute" if joint_desc.get("type") == "continuous" else joint_desc.get("type")),
-            "initial_dof": initial_target_value,
-            "final_dof": final_target_value,
-            "initial_dof_all": np.asarray(dof_initial).reshape(np.asarray(dof_initial).shape[0], -1)[0].astype(float).tolist(),
-            "closed_dof_reference": closed_dof_reference.astype(float).tolist(),
-            "closed_init_check": _json_safe(closed_init_check),
-            "delta": final_delta,
-            "legacy_pre_grasp_offset": 0.2,
-            "legacy_grasp_offset": 0.1,
-            "legacy_pull_steps": 30,
-            "legacy_pull_step": 0.01,
-            "placement_mode": placement_mode,
-            "support_surface_z": support_surface_z,
-            "arti_pose_z": arti_pose_z,
-            "settle_steps": 1000,
-            "video": video_path,
-            "video_writer": (video_result or {}).get("writer"),
-            "video_result": video_result,
-            "video_metadata": video_metadata,
-            "frame_metadata": frame_metadata,
-            "target_dof_index": target_dof_index,
-        }
-        _write_attempt_result(gym.save_root, result)
-        if requested_joint_type is None:
+            video_result = None
+            if args.save_video:
+                video_result = _write_video_mp4_from_frame_list(gym.save_root, getattr(gym, "video_frames", []), output_name="manipulation.mp4")
+            video_path = (video_result or {}).get("path") or os.path.join(gym.save_root, "manipulation.mp4")
+            frame_metadata = (video_result or {}).get("frame_metadata") or _frame_sequence_metadata(gym.save_root, extension="png")
+            video_metadata = (video_result or {}).get("video_metadata") or _probe_video_metadata(video_path)
+            initial_target_value = None
+            final_target_value = None
+            closed_dof_reference = np.asarray(gym.arti_obj_dof_props["lower"], dtype=np.float32)
+            dof_before_closed_reset = _get_arti_dof_positions(gym)
+            closed_reference = _reset_arti_dofs_to_closed(gym)
+            dof_after_closed_reset = _get_arti_dof_positions(gym)
+            closed_init_check = {
+                "before": np.asarray(dof_before_closed_reset).astype(float).tolist(),
+                "after": np.asarray(dof_after_closed_reset).astype(float).tolist(),
+                "closed_reference": np.asarray(closed_reference).astype(float).tolist(),
+                "applied": bool(np.allclose(np.asarray(dof_after_closed_reset), np.asarray(closed_reference), atol=1e-6)),
+                "max_abs_error_after": float(np.max(np.abs(np.asarray(dof_after_closed_reset) - np.asarray(closed_reference)))),
+            }
+            print(f"[DIAG] closed init check: {json.dumps(closed_init_check, sort_keys=True)}")
+            if target_dof_index is not None:
+                initial_target_value = float(np.asarray(dof_initial).reshape(np.asarray(dof_initial).shape[0], -1)[0, target_dof_index])
+                final_target_value = float(np.asarray(final_dof).reshape(np.asarray(final_dof).shape[0], -1)[0, target_dof_index])
+            result = {
+                "asset_id": gapart_id,
+                "object_path": args.object_path,
+                "task_root": args.task_root,
+                "save_root": gym.save_root,
+                "mode": args.mode,
+                "save_video": bool(args.save_video),
+                "save_video_frames": bool(args.save_video_frames),
+                "frame_extension": "png" if args.save_video_frames else None,
+                **_make_control_profile_metadata(requested_joint_type, legacy_demo_executed),
+                "requested_joint_type": requested_joint_type,
+                "resolved_joint_type": resolved_joint_type,
+                "legacy_bbox_id": -1,
+                "tested_part_id": int(args.part_id) if args.part_id is not None else None,
+                "selected_bbox_id": int(bbox_id),
+                "selected_source": selected_source,
+                "selected_link": selected_link,
+                "selected_category": selected_category,
+                "selected_joint": _json_safe(resolved_joint),
+                "joint_name": None if joint_desc is None else joint_desc.get("name"),
+                "joint_type": None if joint_desc is None else ("revolute" if joint_desc.get("type") == "continuous" else joint_desc.get("type")),
+                "initial_dof": initial_target_value,
+                "final_dof": final_target_value,
+                "initial_dof_all": np.asarray(dof_initial).reshape(np.asarray(dof_initial).shape[0], -1)[0].astype(float).tolist(),
+                "closed_dof_reference": closed_dof_reference.astype(float).tolist(),
+                "closed_init_check": _json_safe(closed_init_check),
+                "delta": final_delta,
+                "legacy_pre_grasp_offset": 0.2,
+                "legacy_grasp_offset": 0.1,
+                "legacy_pull_steps": 30,
+                "legacy_pull_step": 0.01,
+                "placement_mode": placement_mode,
+                "support_surface_z": support_surface_z,
+                "arti_pose_z": arti_pose_z,
+                "settle_steps": 1000,
+                "video": video_path,
+                "video_writer": (video_result or {}).get("writer"),
+                "video_result": video_result,
+                "video_metadata": video_metadata,
+                "frame_metadata": frame_metadata,
+                "target_dof_index": target_dof_index,
+            }
+            _write_attempt_result(gym.save_root, result)
             gym.clean_up()
             del gym
             continue
-        print(f"[DIAG] requested_joint_type={requested_joint_type}; continue with joint-aware manipulation path")
+        removed_video_frames = _reset_video_capture_buffer(gym, remove_disk_frames=True)
+        print(f"[DIAG] requested_joint_type={requested_joint_type}; skip legacy straight-line demo and start joint-aware manipulation path")
+        if removed_video_frames:
+            print(f"[DIAG] cleared {removed_video_frames} stale video frame files before joint-aware recording")
         
         # Root-cause note for the 41510 closed-state regression: the failing
         # closed-state run keeps joint_1 near zero but has joint_0 at a very
@@ -1641,8 +1737,10 @@ elif args.mode == "run_arti_open":
         selected_attempt_label = None
         selected_attempt_dof = None
         selected_attempt_stopped_during_pull = False
+        joint_aware_attempt_count = 0
         pull_step_gripper_metrics = []
         for candidate_i, candidate in enumerate(candidates):
+            joint_aware_attempt_count += 1
             cand_label = candidate["label"]
             cand_grasp_offset = float(candidate["grasp_offset"])
             cand_bias = np.asarray(candidate.get("bias", np.zeros(3)), dtype=np.float32)
@@ -1907,6 +2005,7 @@ elif args.mode == "run_arti_open":
             "save_video": bool(args.save_video),
             "save_video_frames": bool(args.save_video_frames),
             "frame_extension": "png" if args.save_video_frames else None,
+            **_make_control_profile_metadata(requested_joint_type, legacy_demo_executed),
             "baseline_success_standard": "old_video" if gapart_id == "45661" else "joint_delta_and_gripper_on_handle",
             "requested_joint_type": requested_joint_type,
             "resolved_joint_type": resolved_joint_type,
@@ -1941,6 +2040,7 @@ elif args.mode == "run_arti_open":
             "settle_steps": settle_steps,
             "assisted_revolute_applied": assisted_revolute_applied,
             "target_dof_index": target_dof_index,
+            "joint_aware_attempt_count": joint_aware_attempt_count,
             "pull_step_gripper_metrics": _json_safe(pull_step_gripper_metrics),
             "ever_on_handle_during_pull": bool(any(item.get("on_handle") for item in pull_step_gripper_metrics)),
             "first_on_handle_step": next((item for item in pull_step_gripper_metrics if item.get("on_handle")), None),

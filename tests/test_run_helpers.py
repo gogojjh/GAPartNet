@@ -38,9 +38,13 @@ HELPERS = {
     "_write_video_mp4_from_frame_list",
     "_legacy_output_baseline_metadata",
     "_json_safe",
+    "_discard_video_frames_from",
     "_normalize_requested_joint_type",
     "_normalize_resolved_joint_type",
     "_joint_type_mismatch_result",
+    "_should_run_legacy_open_demo",
+    "_reset_video_capture_buffer",
+    "_make_control_profile_metadata",
 }
 
 
@@ -459,8 +463,11 @@ def test_write_video_from_frame_list_does_not_create_png_sidecars_by_default(tmp
     result = helpers._write_video_mp4_from_frame_list(str(tmp_path), frames, output_name="manipulation.mp4", fps=5)
 
     assert result["path"].endswith("manipulation.mp4")
-    assert result["writer"] == "opencv_mp4v"
+    assert result["writer"] in {"ffmpeg_rawvideo", "opencv_mp4v"}
     assert result["frame_metadata"]["count"] == 2
+    assert result["video_metadata"]["exists"] is True
+    assert result["video_metadata"]["width"] == 10
+    assert result["video_metadata"]["height"] == 8
     assert pathlib.Path(result["path"]).exists()
     assert not (tmp_path / "video").exists()
 
@@ -477,6 +484,50 @@ def test_legacy_output_without_result_is_visual_baseline_not_joint_identity(tmp_
     assert metadata["baseline_result_json_exists"] is False
     assert metadata["joint_identity_inferred"] is False
     assert metadata["baseline_video_metadata"]["exists"] is True
+
+
+def test_joint_type_request_skips_legacy_open_demo():
+    helpers = load_helpers()
+
+    assert helpers._should_run_legacy_open_demo(None) is True
+    assert helpers._should_run_legacy_open_demo("prismatic") is False
+    assert helpers._should_run_legacy_open_demo("revolute") is False
+
+
+def test_control_profile_metadata_marks_joint_aware_without_legacy_demo():
+    helpers = load_helpers()
+
+    metadata = helpers._make_control_profile_metadata(
+        requested_joint_type="revolute",
+        legacy_demo_executed=False,
+    )
+
+    assert metadata == {
+        "control_profile": "joint_aware_run_arti_open",
+        "legacy_demo_executed": False,
+    }
+
+
+def test_reset_video_capture_buffer_clears_memory_and_disk_frames(tmp_path):
+    helpers = load_helpers()
+    video_dir = tmp_path / "video"
+    video_dir.mkdir()
+    (video_dir / "step-0000.png").write_bytes(b"legacy")
+    (video_dir / "step-0001.png").write_bytes(b"legacy")
+
+    class DummyGym:
+        save_root = str(tmp_path)
+
+        def __init__(self):
+            self.video_frames = ["legacy-frame-0", "legacy-frame-1"]
+
+    gym = DummyGym()
+
+    removed = helpers._reset_video_capture_buffer(gym, remove_disk_frames=True)
+
+    assert removed == 2
+    assert gym.video_frames == []
+    assert list(video_dir.glob("step-*.png")) == []
 
 
 def test_json_safe_converts_numpy_values():
@@ -533,6 +584,8 @@ def test_joint_type_mismatch_result_stops_before_operation():
     assert result["failure_reason"] == "requested_joint_type_mismatch"
     assert result["requested_joint_type"] == "revolute"
     assert result["resolved_joint_type"] == "prismatic"
+    assert result["control_profile"] == "joint_aware_run_arti_open"
+    assert result["legacy_demo_executed"] is False
     assert result["tested_part_id"] == 2
     assert result["selected_joint"] == {"name": "joint_1", "type": "prismatic"}
 
