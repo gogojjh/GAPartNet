@@ -723,6 +723,41 @@ def _format_ee_tracking_diag(label, gym, target_position):
     )
 
 
+def _make_stage_feedback(
+    label,
+    gym,
+    target_position=None,
+    dof_now=None,
+    dof_initial=None,
+    target_dof_index=None,
+    handle_bbox=None,
+):
+    """Return structured end-effector, DOF, and optional handle-contact feedback."""
+    gym.refresh_observation(get_visual_obs=False)
+    hand_pos = _tensor_pos_to_np(gym.hand_pos[0]).astype(np.float32)
+    feedback = {
+        "label": str(label),
+        "ee_position": hand_pos.astype(float).tolist(),
+    }
+    if target_position is not None:
+        target = np.asarray(target_position, dtype=np.float32)
+        err = target - hand_pos
+        feedback["target_position"] = target.astype(float).tolist()
+        feedback["tracking_error"] = err.astype(float).tolist()
+        feedback["tracking_error_norm"] = float(np.linalg.norm(err))
+    if dof_now is not None and target_dof_index is not None:
+        dof_arr = np.asarray(dof_now, dtype=np.float32).reshape(np.asarray(dof_now).shape[0], -1)
+        target_value = float(dof_arr[0, int(target_dof_index)])
+        feedback["target_dof_value"] = target_value
+        if dof_initial is not None:
+            initial_arr = np.asarray(dof_initial, dtype=np.float32).reshape(np.asarray(dof_initial).shape[0], -1)
+            feedback["target_dof_delta"] = float(target_value - float(initial_arr[0, int(target_dof_index)]))
+            feedback["target_abs_dof_delta"] = abs(feedback["target_dof_delta"])
+    if handle_bbox is not None:
+        feedback["gripper_handle_metrics"] = _json_safe(_gripper_handle_metrics(gym, handle_bbox))
+    return feedback
+
+
 def _make_prismatic_grasp_candidates(grasp_offset, approach_dir, handle_long=None, handle_short=None):
     """Small closed-state-aware candidate set, nominal first to preserve existing behavior."""
     candidates = [{"label": "nominal", "grasp_offset": float(grasp_offset), "bias": np.zeros(3, dtype=np.float32)}]

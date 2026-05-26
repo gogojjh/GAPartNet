@@ -24,6 +24,7 @@ HELPERS = {
     "_rotation_from_link_to_root",
     "_resolve_controlling_joint",
     "_required_success_delta",
+    "_make_stage_feedback",
     "_is_gripper_on_handle",
     "_tensor_pos_to_np",
     "_segment_intersects_expanded_bbox",
@@ -459,6 +460,56 @@ def test_is_gripper_on_handle_uses_finger_geometry_not_palm_center():
     assert metrics["left_inside"]
     assert metrics["finger_segment_intersects"]
     assert not helpers._is_gripper_on_handle(far_from_handle, bbox, margin=0.03)
+
+
+def test_make_stage_feedback_records_tracking_dof_and_handle_metrics():
+    helpers = load_helpers()
+
+    class DummyTensor:
+        def __init__(self, value):
+            self.value = np.asarray(value, dtype=np.float32)
+        def detach(self):
+            return self
+        def cpu(self):
+            return self
+        def numpy(self):
+            return self.value
+
+    class DummyGym:
+        def __init__(self):
+            self.hand_pos = [DummyTensor([0.9, 0.0, 0.0])]
+            self.leftfinger_pos = [DummyTensor([1.0, 0.0, 0.0])]
+            self.rightfinger_pos = [DummyTensor([1.0, 0.1, 0.0])]
+            self.refreshed = 0
+        def refresh_observation(self, get_visual_obs=False):
+            self.refreshed += 1
+
+    handle_bbox = np.array([
+        [0.95, -0.02, -0.02],
+        [1.05, -0.02, -0.02],
+        [1.05, 0.12, -0.02],
+        [0.95, 0.12, -0.02],
+        [0.95, -0.02, 0.02],
+        [1.05, -0.02, 0.02],
+        [1.05, 0.12, 0.02],
+        [0.95, 0.12, 0.02],
+    ], dtype=np.float32)
+
+    feedback = helpers._make_stage_feedback(
+        "after_gripper_close",
+        DummyGym(),
+        target_position=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        dof_now=np.array([[0.0, 0.25]], dtype=np.float32),
+        dof_initial=np.array([[0.0, 0.10]], dtype=np.float32),
+        target_dof_index=1,
+        handle_bbox=handle_bbox,
+    )
+
+    assert feedback["label"] == "after_gripper_close"
+    assert np.isclose(feedback["tracking_error_norm"], 0.1)
+    assert feedback["target_dof_value"] == 0.25
+    assert np.isclose(feedback["target_dof_delta"], 0.15)
+    assert feedback["gripper_handle_metrics"]["on_handle"] is True
 
 
 def test_transform_handle_bbox_for_final_prismatic_joint_tracks_moved_handle():
