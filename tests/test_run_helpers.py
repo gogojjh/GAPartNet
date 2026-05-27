@@ -863,3 +863,31 @@ def test_orthonormal_frame_from_z_uses_requested_z_axis():
     assert frame.shape == (3, 3)
     assert np.allclose(frame[:, 2], [0.0, 0.0, 1.0])
     assert np.allclose(frame.T @ frame, np.eye(3), atol=1e-6)
+
+
+def test_revolute_arc_target_approach_rotates_with_handle():
+    helpers = load_helpers()
+    geom = {
+        "pivot": np.array([0.0, 0.0, 0.0], dtype=np.float32),
+        "axis_dir": np.array([0.0, 0.0, 1.0], dtype=np.float32),
+        "radial_dir": np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        "radius": 1.0,
+    }
+    approach_dir = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    grasp_offset = 0.1
+
+    targets = helpers._compute_revolute_arc_targets(
+        handle_center=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        grasp_offset=grasp_offset,
+        approach_dir=approach_dir,
+        geom=geom,
+        angle_step=np.deg2rad(30.0),
+        steps=1,
+    )
+
+    expected_handle = np.array([np.cos(np.deg2rad(30)), np.sin(np.deg2rad(30)), 0.0], dtype=np.float32)
+    expected_approach = np.array([-np.sin(np.deg2rad(30)), np.cos(np.deg2rad(30)), 0.0], dtype=np.float32)
+    expected_gripper = expected_handle + grasp_offset * expected_approach
+
+    assert targets.shape == (1, 3)
+    assert np.allclose(targets[0], expected_gripper, atol=1e-5)
