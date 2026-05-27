@@ -9,8 +9,8 @@ import numpy as np
 
 
 DATASET = Path("/Titan/dataset/data_gapartnet/partnet_mobility_StorageFurniture_Table/revolute_joint")
-REPO = Path("/Titan/code/robohike_ws/src/3D-Diffusion-Policy/third_party/GAPartNet")
-MANIP = REPO / "manipulation"
+MANIP = Path(__file__).resolve().parent
+REPO = MANIP.parent
 TASK_ROOT = MANIP / "output" / "table_revolute"
 AGGREGATE = MANIP / "output" / "table_revolute_results.json"
 MARKDOWN = MANIP / "output" / "table_revolute_summary.md"
