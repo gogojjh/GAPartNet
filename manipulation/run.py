@@ -278,13 +278,13 @@ def _compute_revolute_arc_targets(handle_center, grasp_offset, approach_dir, geo
     axis_dir = _safe_normalize_np(geom["axis_dir"], fallback=np.array([0.0, 0.0, 1.0], dtype=np.float32))
     radial_dir = _safe_normalize_np(geom["radial_dir"], fallback=np.array([1.0, 0.0, 0.0], dtype=np.float32))
     radius = float(geom["radius"])
+    base_offset = float(grasp_offset) * approach_dir
+
     targets = []
     for step_i in range(steps):
         theta = float(start_angle) + (step_i + 1) * float(angle_step) * float(direction_sign)
         rot = R.from_rotvec(axis_dir * theta).as_matrix().astype(np.float32)
         rotated_radial = rot @ radial_dir
-        rotated_approach = rot @ approach_dir
-        base_offset = float(grasp_offset) * rotated_approach
         targets.append(pivot + radius * rotated_radial + base_offset)
     return np.stack(targets, axis=0).astype(np.float32)
 
