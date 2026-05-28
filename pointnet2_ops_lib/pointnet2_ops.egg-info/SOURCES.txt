@@ -1,7 +1,6 @@
 MANIFEST.in
 setup.py
 pointnet2_ops/__init__.py
-pointnet2_ops/_ext.cpython-38-x86_64-linux-gnu.so
 pointnet2_ops/_version.py
 pointnet2_ops/pointnet2_modules.py
 pointnet2_ops/pointnet2_utils.py
