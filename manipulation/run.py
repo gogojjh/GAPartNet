@@ -1857,10 +1857,8 @@ elif args.mode == "run_arti_open":
             joint_upper = float(gym.arti_obj_dof_props["upper"][target_dof_index])
         final_success_threshold = _required_success_delta(joint_desc, lower=joint_lower, upper=joint_upper)
         success_threshold_for_exit = final_success_threshold
-        if gapart_id == "45661" and is_prismatic_target and np.isfinite(final_success_threshold):
-            # Old-video baseline for 45661 finishes once the upper drawer is
-            # visibly open, before the generic 50%-range batch threshold.
-            success_threshold_for_exit = min(final_success_threshold, 0.18)
+        if is_prismatic_target and np.isfinite(final_success_threshold):
+            success_threshold_for_exit = min(final_success_threshold, 0.15)
         if is_prismatic_target and np.isfinite(final_success_threshold):
             requested_pull_distance = min(
                 max(final_success_threshold + 0.08, pull_step * pull_steps),
