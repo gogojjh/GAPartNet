@@ -224,25 +224,22 @@ def main():
     TASK_ROOT.mkdir(parents=True, exist_ok=True)
 
     for idx, (asset_dir, category) in enumerate(assets, 1):
+        category_prefix = f"{asset_dir.parent.name}_"
+
         if category == "revolute":
             primary_joint_types = {"revolute", "continuous"}
             primary_joint_flag = "revolute"
-            primary_prefix = "revolute_joint_"
             fallback_joint_types = {"prismatic"}
             fallback_joint_flag = "prismatic"
-            fallback_prefix = "prismatic_joint_"
         else:
             primary_joint_types = {"prismatic"}
             primary_joint_flag = "prismatic"
-            primary_prefix = "prismatic_joint_"
             fallback_joint_types = {"revolute", "continuous"}
             fallback_joint_flag = "revolute"
-            fallback_prefix = "revolute_joint_"
 
         target, skip_reason = select_target(asset_dir, primary_joint_types)
         if target is not None:
             joint_type_flag = primary_joint_flag
-            category_prefix = primary_prefix
         else:
             target, skip_reason = select_target(asset_dir, fallback_joint_types)
             if target is None:
@@ -256,7 +253,6 @@ def main():
                 print(f"[IMPORTANT] skip {category} {asset_dir.name}: {skip_reason}", flush=True)
                 continue
             joint_type_flag = fallback_joint_flag
-            category_prefix = fallback_prefix
 
         targets.append(target)
         print(
@@ -266,8 +262,7 @@ def main():
         )
 
         cmd = [
-            "conda", "run", "-n", "3d_dp",
-            "python", "run.py",
+            "/root/miniconda3/envs/3d_dp/bin/python", "run.py",
             "--mode", "run_arti_open",
             "--headless",
             "--save_video",
