@@ -13,6 +13,8 @@ ckpts/
 assets/
 
 # Tool/agent artifacts
+AGENTS.md
+CLAUDE.md
 openspec/
 docs/
 .codex/
@@ -21,11 +23,13 @@ docs/
 
 # Build artifacts
 pointnet2_ops_lib/build/
+pointnet2_ops_lib/pointnet2_ops/*.o
 **/*.egg-info/
 **/*.so
 
 # Runtime outputs
 manipulation/output/
+manipulation/cleanup_manipulation_output_success_only.py
 
 # Python cache
 *.pyc
