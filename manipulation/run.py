@@ -453,6 +453,15 @@ def _compute_pull_targets(init_position, approach_dir, pull_dir, grasp_offset, p
         axis=0,
     )
 
+def _compute_prismatic_pull_targets(init_position, handle_out, grasp_offset, pull_step, pull_steps):
+    """Generate prismatic pull targets along handle_out (legacy-style straight-line pull)."""
+    init_position = np.asarray(init_position, dtype=np.float32)
+    handle_out = _safe_normalize_np(handle_out)
+    return np.stack(
+        [init_position + (grasp_offset + (step_i + 1) * pull_step) * handle_out for step_i in range(pull_steps)],
+        axis=0,
+    )
+
 
 def _compute_revolute_grasp_hold_targets(handle_center, grasp_offset, geom, tangent_step, steps, direction_sign=1.0):
     """Generate a short tangential pull that starts from the handle grasp pose."""
@@ -2036,7 +2045,7 @@ elif args.mode == "run_arti_open":
                 revolute_target_diagnostics["candidate"] = cand_label
                 revolute_target_diagnostics_by_attempt.append(_json_safe(revolute_target_diagnostics))
             else:
-                pull_targets = _compute_pull_targets(init_position + cand_bias, approach_dir, pull_dir, cand_grasp_offset, pull_step, pull_steps)
+                pull_targets = _compute_prismatic_pull_targets(init_position + cand_bias, approach_dir, cand_grasp_offset, pull_step, pull_steps)
             print(f"[DIAG] pull first target[{cand_label}]: {pull_targets[0]}")
             print(f"[DIAG] pull final target[{cand_label}]: {pull_targets[-1]}")
             early_delta = 0.0
